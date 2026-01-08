@@ -5,7 +5,7 @@ use arboard::Clipboard;
 use base64::Engine;
 
 use crate::data::Conversation;
-use crate::db::{Database, Tag};
+use crate::db::{Database, FileData, Tag};
 
 /// Check if we're running in an SSH session
 fn is_ssh_session() -> bool {
@@ -420,13 +420,12 @@ pub struct App {
     pub marked: std::collections::HashSet<usize>,
     // Database for notes and tags
     pub db: Database,
-    // Notes state
+    // In-memory cache of all tag/note data for this file
+    pub file_data: FileData,
+    // Notes state (for UI editing)
     pub notes: NotesState,
     // Tag picker state
     pub tag_picker: TagPickerState,
-    // Cache of which lines have tags/notes (for display indicators)
-    pub tagged_lines: std::collections::HashSet<usize>,
-    pub noted_lines: std::collections::HashSet<usize>,
 }
 
 impl App {
@@ -443,9 +442,11 @@ impl App {
             .collect();
         metadata_fields.sort();
 
-        // Load cached tag/note indicators
-        let tagged_lines = db.get_tagged_lines(&file_hash).unwrap_or_default();
-        let noted_lines = db.get_noted_lines(&file_hash).unwrap_or_default();
+        // Load all tag/note data into memory
+        let mut file_data = db.load_file_data(&file_hash).unwrap_or_else(|_| {
+            FileData::new(vec![], HashMap::new(), HashMap::new())
+        });
+        file_data.snapshot_original();
 
         Self {
             conversations,
@@ -462,10 +463,18 @@ impl App {
             metadata_fields,
             marked: std::collections::HashSet::new(),
             db,
+            file_data,
             notes: NotesState::default(),
             tag_picker: TagPickerState::default(),
-            tagged_lines,
-            noted_lines,
+        }
+    }
+
+    /// Save any modified data back to the database
+    pub fn save(&self) {
+        if self.file_data.is_dirty() {
+            if let Err(e) = self.db.save_file_data(&self.file_hash, &self.file_data) {
+                eprintln!("Warning: Failed to save data: {}", e);
+            }
         }
     }
 
@@ -491,20 +500,19 @@ impl App {
                     return false;
                 }
 
-                // Check special filters
+                // Check special filters (all in-memory, fast)
                 for special in &self.filter.special_filters {
                     let matches = match special {
-                        SpecialFilter::HasAnyTag => self.tagged_lines.contains(&c.source_line),
-                        SpecialFilter::HasNote => self.noted_lines.contains(&c.source_line),
-                        SpecialFilter::NoTags => !self.tagged_lines.contains(&c.source_line),
-                        SpecialFilter::NoNote => !self.noted_lines.contains(&c.source_line),
+                        SpecialFilter::HasAnyTag => self.file_data.has_tags(c.source_line),
+                        SpecialFilter::HasNote => self.file_data.has_note(c.source_line),
+                        SpecialFilter::NoTags => !self.file_data.has_tags(c.source_line),
+                        SpecialFilter::NoNote => !self.file_data.has_note(c.source_line),
                         SpecialFilter::HasTag(name) => {
-                            // Check if conversation has the specific tag
-                            if let Ok(tags) = self.db.get_conversation_tags(&self.file_hash, c.source_line) {
-                                tags.iter().any(|t| t.name.to_lowercase() == *name)
-                            } else {
-                                false
-                            }
+                            // Check if conversation has the specific tag (in-memory lookup)
+                            self.file_data
+                                .get_tags(c.source_line)
+                                .iter()
+                                .any(|t| t.name.to_lowercase() == *name)
                         }
                     };
                     if !matches {
@@ -828,24 +836,16 @@ impl App {
     fn load_current_note(&mut self) {
         if let Some(line) = self.current_line_number() {
             self.notes.content = self
-                .db
-                .get_note(&self.file_hash, line)
-                .ok()
-                .flatten()
-                .map(|n| n.content)
+                .file_data
+                .get_note(line)
+                .map(|s| s.to_string())
                 .unwrap_or_default();
         }
     }
 
     fn save_current_note(&mut self) {
         if let Some(line) = self.current_line_number() {
-            let _ = self.db.set_note(&self.file_hash, line, &self.notes.content);
-            // Update cache
-            if self.notes.content.trim().is_empty() {
-                self.noted_lines.remove(&line);
-            } else {
-                self.noted_lines.insert(line);
-            }
+            self.file_data.set_note(line, self.notes.content.clone());
         }
     }
 
@@ -863,7 +863,7 @@ impl App {
 
     // Tags
     pub fn enter_tag_picker(&mut self) {
-        self.tag_picker.available_tags = self.db.get_all_tags().unwrap_or_default();
+        self.tag_picker.available_tags = self.file_data.tags.clone();
         self.tag_picker.selected_index = 0;
         self.tag_picker.is_creating = false;
         self.tag_picker.new_tag_input.clear();
@@ -875,7 +875,7 @@ impl App {
     }
 
     pub fn enter_tag_manager(&mut self) {
-        self.tag_picker.available_tags = self.db.get_all_tags().unwrap_or_default();
+        self.tag_picker.available_tags = self.file_data.tags.clone();
         self.tag_picker.selected_index = 0;
         self.tag_picker.is_creating = false;
         self.tag_picker.new_tag_input.clear();
@@ -920,19 +920,7 @@ impl App {
         };
 
         for line in lines {
-            if let Ok(added) = self.db.toggle_conversation_tag(&self.file_hash, line, tag.id) {
-                // Update cache
-                if added {
-                    self.tagged_lines.insert(line);
-                } else {
-                    // Check if any tags remain
-                    if let Ok(tags) = self.db.get_conversation_tag_ids(&self.file_hash, line) {
-                        if tags.is_empty() {
-                            self.tagged_lines.remove(&line);
-                        }
-                    }
-                }
-            }
+            self.file_data.toggle_tag(line, tag.id);
         }
     }
 
@@ -957,9 +945,13 @@ impl App {
     pub fn confirm_create_tag(&mut self) {
         let name = self.tag_picker.new_tag_input.trim();
         if !name.is_empty() {
+            // Tags are global, so write to DB immediately
             if let Ok(tag) = self.db.create_tag(name) {
-                self.tag_picker.available_tags.push(tag);
+                self.tag_picker.available_tags.push(tag.clone());
                 self.tag_picker.available_tags.sort_by(|a, b| a.name.cmp(&b.name));
+                // Also update file_data tags
+                self.file_data.tags.push(tag);
+                self.file_data.tags.sort_by(|a, b| a.name.cmp(&b.name));
             }
         }
         self.tag_picker.is_creating = false;
@@ -968,6 +960,7 @@ impl App {
 
     pub fn delete_selected_tag(&mut self) {
         if let Some(tag) = self.tag_picker.available_tags.get(self.tag_picker.selected_index).cloned() {
+            // Tags are global, so delete from DB immediately
             if self.db.delete_tag(tag.id).is_ok() {
                 self.tag_picker.available_tags.remove(self.tag_picker.selected_index);
                 if self.tag_picker.selected_index >= self.tag_picker.available_tags.len()
@@ -975,8 +968,12 @@ impl App {
                 {
                     self.tag_picker.selected_index -= 1;
                 }
-                // Refresh tagged_lines cache
-                self.tagged_lines = self.db.get_tagged_lines(&self.file_hash).unwrap_or_default();
+                // Also remove from file_data tags
+                self.file_data.tags.retain(|t| t.id != tag.id);
+                // Remove this tag from all conversations in memory
+                for tags in self.file_data.conversation_tags.values_mut() {
+                    tags.remove(&tag.id);
+                }
             }
         }
     }

@@ -78,8 +78,8 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(display_idx, (actual_idx, conv))| {
             let preview = conv.preview();
             let is_marked = app.is_marked(*actual_idx);
-            let has_tags = app.tagged_lines.contains(&conv.source_line);
-            let has_note = app.noted_lines.contains(&conv.source_line);
+            let has_tags = app.file_data.has_tags(conv.source_line);
+            let has_note = app.file_data.has_note(conv.source_line);
 
             // Build prefix: mark indicator, then tag/note indicators
             let mark_char = if is_marked { "●" } else { " " };
@@ -510,10 +510,7 @@ fn draw_tag_picker_popup(frame: &mut Frame, app: &App) {
 
     let conv = app.selected_conversation();
     let current_line = conv.map(|c| c.source_line).unwrap_or(0);
-    let current_tag_ids = app
-        .db
-        .get_conversation_tag_ids(&app.file_hash, current_line)
-        .unwrap_or_default();
+    let current_tag_ids = app.file_data.get_tag_ids(current_line);
 
     let items: Vec<ListItem> = app
         .tag_picker

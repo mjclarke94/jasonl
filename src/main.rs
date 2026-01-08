@@ -94,6 +94,9 @@ fn main() -> Result<()> {
     let mut app = App::new(conversations, cli.file, file_hash, database);
     let result = run_app(&mut terminal, &mut app);
 
+    // Save any modified data before exiting
+    app.save();
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
