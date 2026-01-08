@@ -312,10 +312,6 @@ impl FilterState {
         // Note: special filters are checked separately in App::filter_matches
     }
 
-    pub fn has_special_filters(&self) -> bool {
-        !self.special_filters.is_empty()
-    }
-
     /// Reset completion state (call when expression changes via typing)
     pub fn reset_completion(&mut self) {
         self.completion_prefix.clear();
@@ -940,22 +936,6 @@ impl App {
         }
     }
 
-    pub fn get_current_tags(&self) -> Vec<Tag> {
-        if let Some(line) = self.current_line_number() {
-            self.db.get_conversation_tags(&self.file_hash, line).unwrap_or_default()
-        } else {
-            vec![]
-        }
-    }
-
-    pub fn get_current_tag_ids(&self) -> std::collections::HashSet<i64> {
-        if let Some(line) = self.current_line_number() {
-            self.db.get_conversation_tag_ids(&self.file_hash, line).unwrap_or_default()
-        } else {
-            std::collections::HashSet::new()
-        }
-    }
-
     pub fn start_create_tag(&mut self) {
         self.tag_picker.is_creating = true;
         self.tag_picker.new_tag_input.clear();
@@ -999,14 +979,6 @@ impl App {
                 self.tagged_lines = self.db.get_tagged_lines(&self.file_hash).unwrap_or_default();
             }
         }
-    }
-
-    pub fn has_tags(&self, line: usize) -> bool {
-        self.tagged_lines.contains(&line)
-    }
-
-    pub fn has_note(&self, line: usize) -> bool {
-        self.noted_lines.contains(&line)
     }
 
     // Help
