@@ -32,6 +32,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('Y') => { app.copy_as_formatted(); }
         KeyCode::Char('v') => app.toggle_mark(),
         KeyCode::Char('V') => app.clear_marks(),
+        KeyCode::Char('*') => app.select_all_visible(),
         KeyCode::Char('o') => app.toggle_notes_panel(),
         KeyCode::Char('O') => app.enter_notes_mode(),
         KeyCode::Char('t') => app.enter_tag_picker(),

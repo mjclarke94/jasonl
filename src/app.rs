@@ -227,10 +227,42 @@ impl Filter {
     }
 }
 
+/// Special filters for tags and notes
+#[derive(Debug, Clone)]
+pub enum SpecialFilter {
+    HasTag(String),    // tag:name - has specific tag
+    HasAnyTag,         // has:tags - has any tag
+    HasNote,           // has:notes - has a note
+    NoTags,            // no:tags - has no tags
+    NoNote,            // no:notes - has no note
+}
+
+impl SpecialFilter {
+    pub fn parse(expr: &str) -> Option<Self> {
+        let expr = expr.trim().to_lowercase();
+
+        if let Some(tag_name) = expr.strip_prefix("tag:") {
+            let tag_name = tag_name.trim();
+            if !tag_name.is_empty() {
+                return Some(SpecialFilter::HasTag(tag_name.to_string()));
+            }
+        }
+
+        match expr.as_str() {
+            "has:tags" | "has:tag" => Some(SpecialFilter::HasAnyTag),
+            "has:notes" | "has:note" => Some(SpecialFilter::HasNote),
+            "no:tags" | "no:tag" => Some(SpecialFilter::NoTags),
+            "no:notes" | "no:note" => Some(SpecialFilter::NoNote),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FilterState {
     pub expression: String,
     pub filters: Vec<Filter>,
+    pub special_filters: Vec<SpecialFilter>,
     pub error: Option<String>,
     // Completion state
     completion_prefix: String,
@@ -240,11 +272,12 @@ pub struct FilterState {
 
 impl FilterState {
     pub fn is_active(&self) -> bool {
-        !self.filters.is_empty()
+        !self.filters.is_empty() || !self.special_filters.is_empty()
     }
 
     pub fn update(&mut self) {
         self.filters.clear();
+        self.special_filters.clear();
         self.error = None;
 
         if self.expression.trim().is_empty() {
@@ -259,7 +292,10 @@ impl FilterState {
             .collect();
 
         for part in parts {
-            if let Some(filter) = Filter::parse(part) {
+            // Try special filter first
+            if let Some(special) = SpecialFilter::parse(part) {
+                self.special_filters.push(special);
+            } else if let Some(filter) = Filter::parse(part) {
                 self.filters.push(filter);
             } else if !part.is_empty() {
                 self.error = Some(format!("Invalid filter: {}", part));
@@ -269,10 +305,15 @@ impl FilterState {
     }
 
     pub fn matches(&self, conv: &Conversation) -> bool {
-        if self.filters.is_empty() {
+        if self.filters.is_empty() && self.special_filters.is_empty() {
             return true;
         }
         self.filters.iter().all(|f| f.matches(conv))
+        // Note: special filters are checked separately in App::filter_matches
+    }
+
+    pub fn has_special_filters(&self) -> bool {
+        !self.special_filters.is_empty()
     }
 
     /// Reset completion state (call when expression changes via typing)
@@ -448,7 +489,35 @@ impl App {
             .conversations
             .iter()
             .enumerate()
-            .filter(|(_, c)| self.filter.matches(c))
+            .filter(|(_, c)| {
+                // Check regular metadata filters
+                if !self.filter.matches(c) {
+                    return false;
+                }
+
+                // Check special filters
+                for special in &self.filter.special_filters {
+                    let matches = match special {
+                        SpecialFilter::HasAnyTag => self.tagged_lines.contains(&c.source_line),
+                        SpecialFilter::HasNote => self.noted_lines.contains(&c.source_line),
+                        SpecialFilter::NoTags => !self.tagged_lines.contains(&c.source_line),
+                        SpecialFilter::NoNote => !self.noted_lines.contains(&c.source_line),
+                        SpecialFilter::HasTag(name) => {
+                            // Check if conversation has the specific tag
+                            if let Ok(tags) = self.db.get_conversation_tags(&self.file_hash, c.source_line) {
+                                tags.iter().any(|t| t.name.to_lowercase() == *name)
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if !matches {
+                        return false;
+                    }
+                }
+
+                true
+            })
             .map(|(i, _)| i)
             .collect();
     }
@@ -675,6 +744,14 @@ impl App {
         self.marked.clear();
     }
 
+    /// Mark all currently visible conversations
+    pub fn select_all_visible(&mut self) {
+        let indices = self.effective_indices();
+        for idx in indices {
+            self.marked.insert(idx);
+        }
+    }
+
     /// Check if a conversation (by actual index) is marked
     pub fn is_marked(&self, actual_index: usize) -> bool {
         self.marked.contains(&actual_index)
@@ -832,10 +909,21 @@ impl App {
     }
 
     pub fn toggle_selected_tag(&mut self) {
-        if let (Some(tag), Some(line)) = (
-            self.tag_picker.available_tags.get(self.tag_picker.selected_index).cloned(),
-            self.current_line_number(),
-        ) {
+        let Some(tag) = self.tag_picker.available_tags.get(self.tag_picker.selected_index).cloned() else {
+            return;
+        };
+
+        // Get line numbers to operate on: marked conversations or current
+        let lines: Vec<usize> = if self.marked.is_empty() {
+            self.current_line_number().into_iter().collect()
+        } else {
+            self.marked
+                .iter()
+                .filter_map(|&idx| self.conversations.get(idx).map(|c| c.source_line))
+                .collect()
+        };
+
+        for line in lines {
             if let Ok(added) = self.db.toggle_conversation_tag(&self.file_hash, line, tag.id) {
                 // Update cache
                 if added {
