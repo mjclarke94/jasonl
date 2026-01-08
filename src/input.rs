@@ -8,6 +8,9 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         Mode::Search => handle_search_mode(app, key),
         Mode::Filter => handle_filter_mode(app, key),
         Mode::Help => handle_help_mode(app, key),
+        Mode::Notes => handle_notes_mode(app, key),
+        Mode::TagPicker => handle_tag_picker_mode(app, key),
+        Mode::TagManager => handle_tag_manager_mode(app, key),
     }
 }
 
@@ -29,6 +32,10 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('Y') => { app.copy_as_formatted(); }
         KeyCode::Char('v') => app.toggle_mark(),
         KeyCode::Char('V') => app.clear_marks(),
+        KeyCode::Char('o') => app.toggle_notes_panel(),
+        KeyCode::Char('O') => app.enter_notes_mode(),
+        KeyCode::Char('t') => app.enter_tag_picker(),
+        KeyCode::Char('T') => app.enter_tag_manager(),
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Esc => {
             if app.filter.is_active() {
@@ -99,5 +106,69 @@ fn handle_help_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') | KeyCode::Esc => app.toggle_help(),
         _ => {}
+    }
+}
+
+fn handle_notes_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.exit_notes_mode(),
+        KeyCode::Enter => app.note_newline(),
+        KeyCode::Backspace => app.pop_note_char(),
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if c == 's' {
+                    app.exit_notes_mode(); // Save and exit
+                }
+            } else {
+                app.push_note_char(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_tag_picker_mode(app: &mut App, key: KeyEvent) {
+    if app.tag_picker.is_creating {
+        // Creating a new tag
+        match key.code {
+            KeyCode::Esc => app.cancel_create_tag(),
+            KeyCode::Enter => app.confirm_create_tag(),
+            KeyCode::Backspace => app.pop_new_tag_char(),
+            KeyCode::Char(c) => app.push_new_tag_char(c),
+            _ => {}
+        }
+    } else {
+        // Selecting tags
+        match key.code {
+            KeyCode::Esc => app.exit_tag_picker(),
+            KeyCode::Char('j') | KeyCode::Down => app.tag_picker_next(),
+            KeyCode::Char('k') | KeyCode::Up => app.tag_picker_prev(),
+            KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_tag(),
+            KeyCode::Char('a') => app.start_create_tag(), // Add new tag
+            _ => {}
+        }
+    }
+}
+
+fn handle_tag_manager_mode(app: &mut App, key: KeyEvent) {
+    if app.tag_picker.is_creating {
+        // Creating a new tag
+        match key.code {
+            KeyCode::Esc => app.cancel_create_tag(),
+            KeyCode::Enter => app.confirm_create_tag(),
+            KeyCode::Backspace => app.pop_new_tag_char(),
+            KeyCode::Char(c) => app.push_new_tag_char(c),
+            _ => {}
+        }
+    } else {
+        // Managing tags
+        match key.code {
+            KeyCode::Esc => app.exit_tag_manager(),
+            KeyCode::Char('j') | KeyCode::Down => app.tag_picker_next(),
+            KeyCode::Char('k') | KeyCode::Up => app.tag_picker_prev(),
+            KeyCode::Char('a') => app.start_create_tag(),
+            KeyCode::Char('d') | KeyCode::Delete => app.delete_selected_tag(),
+            _ => {}
+        }
     }
 }

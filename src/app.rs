@@ -5,6 +5,7 @@ use arboard::Clipboard;
 use base64::Engine;
 
 use crate::data::Conversation;
+use crate::db::{Database, Tag};
 
 /// Check if we're running in an SSH session
 fn is_ssh_session() -> bool {
@@ -105,6 +106,9 @@ pub enum Mode {
     Search,
     Filter,
     Help,
+    Notes,      // Editing notes for current conversation
+    TagPicker,  // Selecting tags for current conversation
+    TagManager, // Creating/deleting tags
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,12 +347,29 @@ pub struct SearchState {
     pub current_match: usize,
 }
 
+/// State for notes editing
+#[derive(Debug, Default)]
+pub struct NotesState {
+    pub content: String,
+    pub visible: bool,
+}
+
+/// State for tag picker
+#[derive(Debug, Default)]
+pub struct TagPickerState {
+    pub available_tags: Vec<Tag>,
+    pub selected_index: usize,
+    pub new_tag_input: String,
+    pub is_creating: bool, // If true, we're in "create new tag" mode
+}
+
 pub struct App {
     pub conversations: Vec<Conversation>,
     pub selected_index: usize,
     pub scroll_offset: u16,
     pub mode: Mode,
     pub file_path: String,
+    pub file_hash: String,
     pub search: SearchState,
     pub filter: FilterState,
     pub should_quit: bool,
@@ -360,10 +381,19 @@ pub struct App {
     pub metadata_fields: Vec<String>,
     // Multi-select: indices of marked conversations
     pub marked: std::collections::HashSet<usize>,
+    // Database for notes and tags
+    pub db: Database,
+    // Notes state
+    pub notes: NotesState,
+    // Tag picker state
+    pub tag_picker: TagPickerState,
+    // Cache of which lines have tags/notes (for display indicators)
+    pub tagged_lines: std::collections::HashSet<usize>,
+    pub noted_lines: std::collections::HashSet<usize>,
 }
 
 impl App {
-    pub fn new(conversations: Vec<Conversation>, file_path: String) -> Self {
+    pub fn new(conversations: Vec<Conversation>, file_path: String, file_hash: String, db: Database) -> Self {
         let filtered_indices: Vec<usize> = (0..conversations.len()).collect();
         let global_stats = MetadataStats::from_conversations(conversations.iter());
 
@@ -376,12 +406,17 @@ impl App {
             .collect();
         metadata_fields.sort();
 
+        // Load cached tag/note indicators
+        let tagged_lines = db.get_tagged_lines(&file_hash).unwrap_or_default();
+        let noted_lines = db.get_noted_lines(&file_hash).unwrap_or_default();
+
         Self {
             conversations,
             selected_index: 0,
             scroll_offset: 0,
             mode: Mode::Normal,
             file_path,
+            file_hash,
             search: SearchState::default(),
             filter: FilterState::default(),
             should_quit: false,
@@ -389,6 +424,11 @@ impl App {
             global_stats,
             metadata_fields,
             marked: std::collections::HashSet::new(),
+            db,
+            notes: NotesState::default(),
+            tag_picker: TagPickerState::default(),
+            tagged_lines,
+            noted_lines,
         }
     }
 
@@ -450,6 +490,9 @@ impl App {
         if total > 0 && self.selected_index < total - 1 {
             self.selected_index += 1;
             self.scroll_offset = 0;
+            if self.notes.visible {
+                self.load_current_note();
+            }
         }
     }
 
@@ -457,12 +500,18 @@ impl App {
         if self.selected_index > 0 {
             self.selected_index -= 1;
             self.scroll_offset = 0;
+            if self.notes.visible {
+                self.load_current_note();
+            }
         }
     }
 
     pub fn first_conversation(&mut self) {
         self.selected_index = 0;
         self.scroll_offset = 0;
+        if self.notes.visible {
+            self.load_current_note();
+        }
     }
 
     pub fn last_conversation(&mut self) {
@@ -470,6 +519,9 @@ impl App {
         if total > 0 {
             self.selected_index = total - 1;
             self.scroll_offset = 0;
+            if self.notes.visible {
+                self.load_current_note();
+            }
         }
     }
 
@@ -675,6 +727,198 @@ impl App {
         }
 
         copy_to_clipboard(&text)
+    }
+
+    // Notes
+    pub fn toggle_notes_panel(&mut self) {
+        self.notes.visible = !self.notes.visible;
+        if self.notes.visible {
+            self.load_current_note();
+        }
+    }
+
+    pub fn enter_notes_mode(&mut self) {
+        self.notes.visible = true;
+        self.load_current_note();
+        self.mode = Mode::Notes;
+    }
+
+    pub fn exit_notes_mode(&mut self) {
+        self.save_current_note();
+        self.mode = Mode::Normal;
+    }
+
+    fn current_line_number(&self) -> Option<usize> {
+        self.selected_conversation().map(|c| c.source_line)
+    }
+
+    fn load_current_note(&mut self) {
+        if let Some(line) = self.current_line_number() {
+            self.notes.content = self
+                .db
+                .get_note(&self.file_hash, line)
+                .ok()
+                .flatten()
+                .map(|n| n.content)
+                .unwrap_or_default();
+        }
+    }
+
+    fn save_current_note(&mut self) {
+        if let Some(line) = self.current_line_number() {
+            let _ = self.db.set_note(&self.file_hash, line, &self.notes.content);
+            // Update cache
+            if self.notes.content.trim().is_empty() {
+                self.noted_lines.remove(&line);
+            } else {
+                self.noted_lines.insert(line);
+            }
+        }
+    }
+
+    pub fn push_note_char(&mut self, c: char) {
+        self.notes.content.push(c);
+    }
+
+    pub fn pop_note_char(&mut self) {
+        self.notes.content.pop();
+    }
+
+    pub fn note_newline(&mut self) {
+        self.notes.content.push('\n');
+    }
+
+    // Tags
+    pub fn enter_tag_picker(&mut self) {
+        self.tag_picker.available_tags = self.db.get_all_tags().unwrap_or_default();
+        self.tag_picker.selected_index = 0;
+        self.tag_picker.is_creating = false;
+        self.tag_picker.new_tag_input.clear();
+        self.mode = Mode::TagPicker;
+    }
+
+    pub fn exit_tag_picker(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    pub fn enter_tag_manager(&mut self) {
+        self.tag_picker.available_tags = self.db.get_all_tags().unwrap_or_default();
+        self.tag_picker.selected_index = 0;
+        self.tag_picker.is_creating = false;
+        self.tag_picker.new_tag_input.clear();
+        self.mode = Mode::TagManager;
+    }
+
+    pub fn exit_tag_manager(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    pub fn tag_picker_next(&mut self) {
+        let len = self.tag_picker.available_tags.len();
+        if len > 0 {
+            self.tag_picker.selected_index = (self.tag_picker.selected_index + 1) % len;
+        }
+    }
+
+    pub fn tag_picker_prev(&mut self) {
+        let len = self.tag_picker.available_tags.len();
+        if len > 0 {
+            self.tag_picker.selected_index = if self.tag_picker.selected_index == 0 {
+                len - 1
+            } else {
+                self.tag_picker.selected_index - 1
+            };
+        }
+    }
+
+    pub fn toggle_selected_tag(&mut self) {
+        if let (Some(tag), Some(line)) = (
+            self.tag_picker.available_tags.get(self.tag_picker.selected_index).cloned(),
+            self.current_line_number(),
+        ) {
+            if let Ok(added) = self.db.toggle_conversation_tag(&self.file_hash, line, tag.id) {
+                // Update cache
+                if added {
+                    self.tagged_lines.insert(line);
+                } else {
+                    // Check if any tags remain
+                    if let Ok(tags) = self.db.get_conversation_tag_ids(&self.file_hash, line) {
+                        if tags.is_empty() {
+                            self.tagged_lines.remove(&line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_current_tags(&self) -> Vec<Tag> {
+        if let Some(line) = self.current_line_number() {
+            self.db.get_conversation_tags(&self.file_hash, line).unwrap_or_default()
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn get_current_tag_ids(&self) -> std::collections::HashSet<i64> {
+        if let Some(line) = self.current_line_number() {
+            self.db.get_conversation_tag_ids(&self.file_hash, line).unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        }
+    }
+
+    pub fn start_create_tag(&mut self) {
+        self.tag_picker.is_creating = true;
+        self.tag_picker.new_tag_input.clear();
+    }
+
+    pub fn cancel_create_tag(&mut self) {
+        self.tag_picker.is_creating = false;
+        self.tag_picker.new_tag_input.clear();
+    }
+
+    pub fn push_new_tag_char(&mut self, c: char) {
+        self.tag_picker.new_tag_input.push(c);
+    }
+
+    pub fn pop_new_tag_char(&mut self) {
+        self.tag_picker.new_tag_input.pop();
+    }
+
+    pub fn confirm_create_tag(&mut self) {
+        let name = self.tag_picker.new_tag_input.trim();
+        if !name.is_empty() {
+            if let Ok(tag) = self.db.create_tag(name) {
+                self.tag_picker.available_tags.push(tag);
+                self.tag_picker.available_tags.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
+        self.tag_picker.is_creating = false;
+        self.tag_picker.new_tag_input.clear();
+    }
+
+    pub fn delete_selected_tag(&mut self) {
+        if let Some(tag) = self.tag_picker.available_tags.get(self.tag_picker.selected_index).cloned() {
+            if self.db.delete_tag(tag.id).is_ok() {
+                self.tag_picker.available_tags.remove(self.tag_picker.selected_index);
+                if self.tag_picker.selected_index >= self.tag_picker.available_tags.len()
+                    && self.tag_picker.selected_index > 0
+                {
+                    self.tag_picker.selected_index -= 1;
+                }
+                // Refresh tagged_lines cache
+                self.tagged_lines = self.db.get_tagged_lines(&self.file_hash).unwrap_or_default();
+            }
+        }
+    }
+
+    pub fn has_tags(&self, line: usize) -> bool {
+        self.tagged_lines.contains(&line)
+    }
+
+    pub fn has_note(&self, line: usize) -> bool {
+        self.noted_lines.contains(&line)
     }
 
     // Help

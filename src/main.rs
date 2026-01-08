@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod db;
 mod input;
 mod ui;
 
@@ -17,6 +18,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
 use data::{load_conversations, Schema};
+use db::{hash_file, Database};
 use input::handle_key_event;
 
 #[derive(Parser)]
@@ -46,6 +48,10 @@ struct Cli {
     /// Field to use for list preview (defaults to user field)
     #[arg(long)]
     preview_field: Option<String>,
+
+    /// Path to database file for notes/tags (default: $JASONL_DB_FILE or ~/.config/jasonl/data.db)
+    #[arg(long)]
+    db: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -72,13 +78,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Compute file hash for notes/tags persistence
+    let file_hash = hash_file(&cli.file)?;
+
+    // Open database for notes and tags
+    let db_path = cli.db.as_ref().map(std::path::Path::new);
+    let database = Database::open(db_path)?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(conversations, cli.file);
+    let mut app = App::new(conversations, cli.file, file_hash, database);
     let result = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;

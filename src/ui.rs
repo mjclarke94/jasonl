@@ -46,11 +46,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(main_area);
 
     draw_conversation_list(frame, app, main_chunks[0]);
-    draw_message_view(frame, app, main_chunks[1]);
+
+    // Split right panel if notes are visible
+    if app.notes.visible {
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(main_chunks[1]);
+        draw_message_view(frame, app, right_chunks[0]);
+        draw_notes_panel(frame, app, right_chunks[1]);
+    } else {
+        draw_message_view(frame, app, main_chunks[1]);
+    }
+
     draw_status_bar(frame, app, status_area);
 
-    if app.mode == Mode::Help {
-        draw_help_popup(frame);
+    // Draw popups on top
+    match app.mode {
+        Mode::Help => draw_help_popup(frame),
+        Mode::TagPicker => draw_tag_picker_popup(frame, app),
+        Mode::TagManager => draw_tag_manager_popup(frame, app),
+        _ => {}
     }
 }
 
@@ -62,9 +78,14 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(display_idx, (actual_idx, conv))| {
             let preview = conv.preview();
             let is_marked = app.is_marked(*actual_idx);
+            let has_tags = app.tagged_lines.contains(&conv.source_line);
+            let has_note = app.noted_lines.contains(&conv.source_line);
 
-            let prefix = if is_marked { "● " } else { "  " };
-            let text = format!("{}{}", prefix, preview);
+            // Build prefix: mark indicator, then tag/note indicators
+            let mark_char = if is_marked { "●" } else { " " };
+            let tag_char = if has_tags { "T" } else { " " };
+            let note_char = if has_note { "N" } else { " " };
+            let text = format!("{}{}{} {}", mark_char, tag_char, note_char, preview);
 
             let mut style = if display_idx == app.selected_index {
                 Style::default()
@@ -283,6 +304,59 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             " Press ? or Esc to close help ",
             Style::default().fg(Color::Yellow),
         )),
+        Mode::Notes => Line::from(vec![
+            Span::styled(" NOTES ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::styled(
+                " Type to edit | Esc/Ctrl-S to save and exit ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Mode::TagPicker => {
+            if app.tag_picker.is_creating {
+                Line::from(vec![
+                    Span::styled(" NEW TAG: ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                    Span::styled(
+                        format!("{}█", app.tag_picker.new_tag_input),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        " | Enter to create | Esc to cancel ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(" TAGS ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                    Span::styled(
+                        " j/k:nav  Enter/Space:toggle  a:add  Esc:close ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }
+        }
+        Mode::TagManager => {
+            if app.tag_picker.is_creating {
+                Line::from(vec![
+                    Span::styled(" NEW TAG: ", Style::default().fg(Color::Black).bg(Color::Magenta)),
+                    Span::styled(
+                        format!("{}█", app.tag_picker.new_tag_input),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    Span::styled(
+                        " | Enter to create | Esc to cancel ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(" TAG MANAGER ", Style::default().fg(Color::Black).bg(Color::Magenta)),
+                    Span::styled(
+                        " j/k:nav  a:add  d:delete  Esc:close ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }
+        }
     };
 
     let paragraph = Paragraph::new(status).style(Style::default().bg(Color::Black));
@@ -370,6 +444,12 @@ fn draw_help_popup(frame: &mut Frame) {
         Line::from("  y           Copy as JSONL (marked or current)"),
         Line::from("  Y           Copy as formatted text"),
         Line::from(""),
+        Line::from(Span::styled("Notes & Tags", Style::default().fg(Color::Cyan))),
+        Line::from("  o           Toggle notes panel"),
+        Line::from("  O           Edit notes for conversation"),
+        Line::from("  t           Tag picker (add/remove tags)"),
+        Line::from("  T           Tag manager (create/delete tags)"),
+        Line::from(""),
         Line::from(Span::styled("General", Style::default().fg(Color::Yellow))),
         Line::from("  Esc         Clear filter/search"),
         Line::from("  ?           Toggle this help"),
@@ -385,6 +465,124 @@ fn draw_help_popup(frame: &mut Frame) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn draw_notes_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let is_editing = app.mode == Mode::Notes;
+
+    let title = if is_editing {
+        " Notes (editing) "
+    } else {
+        " Notes (O to edit) "
+    };
+
+    let border_style = if is_editing {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let content = if is_editing {
+        format!("{}█", app.notes.content)
+    } else if app.notes.content.is_empty() {
+        "No notes for this conversation".to_string()
+    } else {
+        app.notes.content.clone()
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    let paragraph = Paragraph::new(content)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_tag_picker_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 50, frame.area());
+
+    let conv = app.selected_conversation();
+    let current_line = conv.map(|c| c.source_line).unwrap_or(0);
+    let current_tag_ids = app
+        .db
+        .get_conversation_tag_ids(&app.file_hash, current_line)
+        .unwrap_or_default();
+
+    let items: Vec<ListItem> = app
+        .tag_picker
+        .available_tags
+        .iter()
+        .enumerate()
+        .map(|(idx, tag)| {
+            let is_selected = idx == app.tag_picker.selected_index;
+            let is_applied = current_tag_ids.contains(&tag.id);
+
+            let checkbox = if is_applied { "[x]" } else { "[ ]" };
+            let text = format!("{} {}", checkbox, tag.name);
+
+            let style = if is_selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let title = format!(" Tags ({}) ", app.tag_picker.available_tags.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black));
+
+    let list = List::new(items).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+}
+
+fn draw_tag_manager_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 50, frame.area());
+
+    let items: Vec<ListItem> = app
+        .tag_picker
+        .available_tags
+        .iter()
+        .enumerate()
+        .map(|(idx, tag)| {
+            let is_selected = idx == app.tag_picker.selected_index;
+            let text = format!("  {}", tag.name);
+
+            let style = if is_selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let title = format!(" Tag Manager ({}) ", app.tag_picker.available_tags.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(Color::Black));
+
+    let list = List::new(items).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
