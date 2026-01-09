@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, CollapseMode, Mode};
 use crate::data::Role;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -42,7 +42,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+        .constraints([
+            Constraint::Percentage(app.list_panel_width),
+            Constraint::Percentage(100 - app.list_panel_width),
+        ])
         .split(main_area);
 
     draw_conversation_list(frame, app, main_chunks[0]);
@@ -66,6 +69,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Help => draw_help_popup(frame),
         Mode::TagPicker => draw_tag_picker_popup(frame, app),
         Mode::TagManager => draw_tag_manager_popup(frame, app),
+        Mode::SortPicker => draw_sort_picker_popup(frame, app),
+        Mode::ConfirmQuit => draw_confirm_quit_popup(frame),
         _ => {}
     }
 }
@@ -78,8 +83,10 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(display_idx, (actual_idx, conv))| {
             let preview = conv.preview();
             let is_marked = app.is_marked(*actual_idx);
-            let has_tags = app.file_data.has_tags(conv.source_line);
-            let has_note = app.file_data.has_note(conv.source_line);
+            let (has_tags, has_note) = app.file_data_map
+                .get(&conv.file_hash)
+                .map(|fd| (fd.has_tags(conv.source_line), fd.has_note(conv.source_line)))
+                .unwrap_or((false, false));
 
             // Build prefix: mark indicator, then tag/note indicators
             let mark_char = if is_marked { "●" } else { " " };
@@ -201,18 +208,39 @@ fn draw_message_view(frame: &mut Frame, app: &App, area: Rect) {
                 Role::Unknown => Style::default().fg(Color::Gray),
             };
 
-            lines.push(Line::from(Span::styled(
-                format!("[{}]", msg.role),
-                role_style,
-            )));
+            // Check if this message should be collapsed
+            let is_collapsed = match app.collapse_mode {
+                CollapseMode::Expanded => false,
+                CollapseMode::SystemOnly => msg.role == Role::System,
+                CollapseMode::AllCollapsed => true,
+            };
 
-            for content_line in msg.content.lines() {
-                let styled_line = if !app.search.query.is_empty() {
-                    highlight_matches(content_line, &app.search.query)
-                } else {
-                    Line::from(content_line.to_string())
-                };
-                lines.push(styled_line);
+            if is_collapsed {
+                // Show collapsed indicator
+                let preview: String = msg.content.chars().take(50).collect();
+                let preview = preview.replace('\n', " ");
+                let suffix = if msg.content.len() > 50 { "..." } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("[{}]", msg.role), role_style),
+                    Span::styled(
+                        format!(" ▶ {}{}", preview, suffix),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("[{}]", msg.role),
+                    role_style,
+                )));
+
+                for content_line in msg.content.lines() {
+                    let styled_line = if !app.search.query.is_empty() {
+                        highlight_matches(content_line, &app.search.query)
+                    } else {
+                        Line::from(content_line.to_string())
+                    };
+                    lines.push(styled_line);
+                }
             }
 
             lines.push(Line::from(""));
@@ -224,7 +252,21 @@ fn draw_message_view(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = if let Some(conv) = app.selected_conversation() {
-        format!(" Line {} ", conv.source_line)
+        let file_indicator = if app.file_data_map.len() > 1 {
+            // Show shortened filename when multiple files loaded
+            let short_name = std::path::Path::new(&conv.source_file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&conv.source_file);
+            format!(" {}:", short_name)
+        } else {
+            String::new()
+        };
+        if app.collapse_mode != CollapseMode::Expanded {
+            format!("{}Line {} [{}] ", file_indicator, conv.source_line, app.collapse_mode.label())
+        } else {
+            format!("{}Line {} ", file_indicator, conv.source_line)
+        }
     } else {
         " Messages ".to_string()
     };
@@ -257,9 +299,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ));
             }
 
+            // Show active sort if present
+            if let Some(ref field) = app.sort.field {
+                spans.push(Span::raw(" | "));
+                spans.push(Span::styled(
+                    format!("sort: {}{} ", field, app.sort.order.symbol()),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(
+                    "(S to clear)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(
-                " j/k:nav  /:search  f:filter  ?:help  q:quit ",
+                " j/k:nav  /:search  f:filter  s:sort  ?:help  q:quit ",
                 Style::default().fg(Color::DarkGray),
             ));
 
@@ -357,6 +412,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ])
             }
         }
+        Mode::SortPicker => Line::from(vec![
+            Span::styled(" SORT ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(
+                " j/k:nav  Enter/Space:toggle  c:clear  Esc:close ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Mode::ConfirmQuit => Line::from(vec![
+            Span::styled(" UNSAVED CHANGES ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(
+                " y:save and quit | n:discard | Esc:cancel ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
     };
 
     let paragraph = Paragraph::new(status).style(Style::default().bg(Color::Black));
@@ -440,6 +509,10 @@ fn draw_help_popup(frame: &mut Frame) {
         Line::from("              Tags: tag:name, has:tags, no:tags"),
         Line::from("              Notes: has:notes, no:notes"),
         Line::from(""),
+        Line::from(Span::styled("Sort", Style::default().fg(Color::Yellow))),
+        Line::from("  s           Open sort picker"),
+        Line::from("  S           Clear sort"),
+        Line::from(""),
         Line::from(Span::styled("Selection", Style::default().fg(Color::Yellow))),
         Line::from("  v           Toggle mark on conversation"),
         Line::from("  V           Clear all marks"),
@@ -454,6 +527,9 @@ fn draw_help_popup(frame: &mut Frame) {
         Line::from("  T           Tag manager (create/delete tags)"),
         Line::from(""),
         Line::from(Span::styled("General", Style::default().fg(Color::Yellow))),
+        Line::from("  c           Cycle collapse mode"),
+        Line::from("  > or .      Increase list panel width"),
+        Line::from("  < or ,      Decrease list panel width"),
         Line::from("  Esc         Clear filter/search"),
         Line::from("  ?           Toggle this help"),
         Line::from("  q           Quit"),
@@ -510,7 +586,10 @@ fn draw_tag_picker_popup(frame: &mut Frame, app: &App) {
 
     let conv = app.selected_conversation();
     let current_line = conv.map(|c| c.source_line).unwrap_or(0);
-    let current_tag_ids = app.file_data.get_tag_ids(current_line);
+    let current_tag_ids = conv
+        .and_then(|c| app.file_data_map.get(&c.file_hash))
+        .map(|fd| fd.get_tag_ids(current_line))
+        .unwrap_or_default();
 
     let items: Vec<ListItem> = app
         .tag_picker
@@ -583,6 +662,89 @@ fn draw_tag_manager_popup(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
+}
+
+fn draw_sort_picker_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+
+    let items: Vec<ListItem> = app
+        .metadata_fields
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let is_selected = idx == app.sort.selected_index;
+            let is_active = app.sort.field.as_ref() == Some(field);
+
+            let symbol = if is_active {
+                app.sort.order.symbol()
+            } else {
+                " "
+            };
+            let text = format!(" {} {}", symbol, field);
+
+            let style = if is_selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let title = format!(" Sort by ({}) ", app.metadata_fields.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let list = List::new(items).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+}
+
+fn draw_confirm_quit_popup(frame: &mut Frame) {
+    let area = centered_rect(50, 20, frame.area());
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "You have unsaved changes.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Save changes before quitting?"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" - Save and quit"),
+        ]),
+        Line::from(vec![
+            Span::styled("  n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" - Discard and quit"),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" - Cancel"),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(" Unsaved Changes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

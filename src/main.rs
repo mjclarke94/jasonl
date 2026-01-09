@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -19,15 +19,16 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 use data::{load_conversations, Schema};
 use db::{hash_file, Database};
-use input::handle_key_event;
+use input::{handle_key_event, handle_mouse_event};
 
 #[derive(Parser)]
 #[command(name = "jasonl")]
 #[command(about = "A TUI viewer for JSONL LLM conversation files")]
 #[command(version)]
 struct Cli {
-    /// Path to the JSONL file to view
-    file: String,
+    /// Path(s) to JSONL file(s) to view
+    #[arg(required = true)]
+    files: Vec<String>,
 
     /// Field name for user/question content (enables custom format mode)
     #[arg(short = 'u', long)]
@@ -71,15 +72,39 @@ fn main() -> Result<()> {
         None
     };
 
-    let conversations = load_conversations(&cli.file, schema.as_ref(), &metadata_fields)?;
+    // Load conversations from all files
+    let mut all_conversations = Vec::new();
+    let mut file_hashes = std::collections::HashMap::new();
 
-    if conversations.is_empty() {
-        eprintln!("No conversations found in {}", cli.file);
+    for file in &cli.files {
+        let file_hash = hash_file(file)?;
+        file_hashes.insert(file.clone(), file_hash.clone());
+
+        match load_conversations(file, schema.as_ref(), &metadata_fields, file, &file_hash) {
+            Ok(convs) => {
+                if convs.is_empty() {
+                    eprintln!("Warning: No conversations found in {}", file);
+                } else {
+                    all_conversations.extend(convs);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load {}: {}", file, e);
+            }
+        }
+    }
+
+    if all_conversations.is_empty() {
+        eprintln!("No conversations found in any file");
         return Ok(());
     }
 
-    // Compute file hash for notes/tags persistence
-    let file_hash = hash_file(&cli.file)?;
+    // Create display path (single file or "N files")
+    let display_path = if cli.files.len() == 1 {
+        cli.files[0].clone()
+    } else {
+        format!("{} files", cli.files.len())
+    };
 
     // Open database for notes and tags
     let db_path = cli.db.as_ref().map(std::path::Path::new);
@@ -87,18 +112,15 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(conversations, cli.file, file_hash, database);
+    let mut app = App::new(all_conversations, display_path, file_hashes, database);
     let result = run_app(&mut terminal, &mut app);
 
-    // Save any modified data before exiting
-    app.save();
-
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
@@ -109,11 +131,14 @@ fn main() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        let frame_size = terminal.get_frame().area();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                handle_key_event(app, key);
+            match event::read()? {
+                Event::Key(key) => handle_key_event(app, key),
+                Event::Mouse(mouse) => handle_mouse_event(app, mouse, frame_size),
+                _ => {}
             }
         }
 

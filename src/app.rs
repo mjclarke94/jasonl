@@ -106,9 +106,44 @@ pub enum Mode {
     Search,
     Filter,
     Help,
-    Notes,      // Editing notes for current conversation
-    TagPicker,  // Selecting tags for current conversation
-    TagManager, // Creating/deleting tags
+    Notes,       // Editing notes for current conversation
+    TagPicker,   // Selecting tags for current conversation
+    TagManager,  // Creating/deleting tags
+    SortPicker,  // Selecting sort field
+    ConfirmQuit, // Confirm quit when unsaved changes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SortOrder {
+    #[default]
+    None,
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    pub fn toggle(self) -> Self {
+        match self {
+            SortOrder::None => SortOrder::Ascending,
+            SortOrder::Ascending => SortOrder::Descending,
+            SortOrder::Descending => SortOrder::None,
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            SortOrder::None => "",
+            SortOrder::Ascending => "↑",
+            SortOrder::Descending => "↓",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SortState {
+    pub field: Option<String>,
+    pub order: SortOrder,
+    pub selected_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -400,15 +435,42 @@ pub struct TagPickerState {
     pub is_creating: bool, // If true, we're in "create new tag" mode
 }
 
+/// Message collapse mode
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CollapseMode {
+    #[default]
+    Expanded,     // All messages expanded
+    SystemOnly,   // Only system messages collapsed
+    AllCollapsed, // All messages collapsed
+}
+
+impl CollapseMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            CollapseMode::Expanded => CollapseMode::SystemOnly,
+            CollapseMode::SystemOnly => CollapseMode::AllCollapsed,
+            CollapseMode::AllCollapsed => CollapseMode::Expanded,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CollapseMode::Expanded => "expanded",
+            CollapseMode::SystemOnly => "sys collapsed",
+            CollapseMode::AllCollapsed => "collapsed",
+        }
+    }
+}
+
 pub struct App {
     pub conversations: Vec<Conversation>,
     pub selected_index: usize,
     pub scroll_offset: u16,
     pub mode: Mode,
     pub file_path: String,
-    pub file_hash: String,
     pub search: SearchState,
     pub filter: FilterState,
+    pub sort: SortState,
     pub should_quit: bool,
     // Cached indices of conversations matching current filter
     filtered_indices: Vec<usize>,
@@ -420,16 +482,20 @@ pub struct App {
     pub marked: std::collections::HashSet<usize>,
     // Database for notes and tags
     pub db: Database,
-    // In-memory cache of all tag/note data for this file
-    pub file_data: FileData,
+    // In-memory cache of tag/note data per file (keyed by file_hash)
+    pub file_data_map: HashMap<String, FileData>,
     // Notes state (for UI editing)
     pub notes: NotesState,
     // Tag picker state
     pub tag_picker: TagPickerState,
+    // UI panel widths (as percentages)
+    pub list_panel_width: u16, // Default 25%
+    // Message collapse mode
+    pub collapse_mode: CollapseMode,
 }
 
 impl App {
-    pub fn new(conversations: Vec<Conversation>, file_path: String, file_hash: String, db: Database) -> Self {
+    pub fn new(conversations: Vec<Conversation>, file_path: String, file_hashes: HashMap<String, String>, db: Database) -> Self {
         let filtered_indices: Vec<usize> = (0..conversations.len()).collect();
         let global_stats = MetadataStats::from_conversations(conversations.iter());
 
@@ -442,11 +508,16 @@ impl App {
             .collect();
         metadata_fields.sort();
 
-        // Load all tag/note data into memory
-        let mut file_data = db.load_file_data(&file_hash).unwrap_or_else(|_| {
-            FileData::new(vec![], HashMap::new(), HashMap::new())
-        });
-        file_data.snapshot_original();
+        // Load all tag/note data into memory for each unique file hash
+        let mut file_data_map: HashMap<String, FileData> = HashMap::new();
+        let unique_hashes: std::collections::HashSet<_> = file_hashes.values().cloned().collect();
+        for hash in unique_hashes {
+            let mut file_data = db.load_file_data(&hash).unwrap_or_else(|_| {
+                FileData::new(vec![], HashMap::new(), HashMap::new())
+            });
+            file_data.snapshot_original();
+            file_data_map.insert(hash, file_data);
+        }
 
         Self {
             conversations,
@@ -454,28 +525,37 @@ impl App {
             scroll_offset: 0,
             mode: Mode::Normal,
             file_path,
-            file_hash,
             search: SearchState::default(),
             filter: FilterState::default(),
+            sort: SortState::default(),
             should_quit: false,
             filtered_indices,
             global_stats,
             metadata_fields,
             marked: std::collections::HashSet::new(),
             db,
-            file_data,
+            file_data_map,
             notes: NotesState::default(),
             tag_picker: TagPickerState::default(),
+            list_panel_width: 25,
+            collapse_mode: CollapseMode::default(),
         }
     }
 
     /// Save any modified data back to the database
     pub fn save(&self) {
-        if self.file_data.is_dirty() {
-            if let Err(e) = self.db.save_file_data(&self.file_hash, &self.file_data) {
-                eprintln!("Warning: Failed to save data: {}", e);
+        for (hash, file_data) in &self.file_data_map {
+            if file_data.is_dirty() {
+                if let Err(e) = self.db.save_file_data(hash, file_data) {
+                    eprintln!("Warning: Failed to save data for {}: {}", hash, e);
+                }
             }
         }
+    }
+
+    /// Check if any file has unsaved changes
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.file_data_map.values().any(|fd| fd.is_dirty())
     }
 
     /// Calculate statistics for currently visible conversations
@@ -500,16 +580,22 @@ impl App {
                     return false;
                 }
 
+                // Get file data for this conversation
+                let file_data = match self.file_data_map.get(&c.file_hash) {
+                    Some(fd) => fd,
+                    None => return true, // No file data means no tags/notes to filter on
+                };
+
                 // Check special filters (all in-memory, fast)
                 for special in &self.filter.special_filters {
                     let matches = match special {
-                        SpecialFilter::HasAnyTag => self.file_data.has_tags(c.source_line),
-                        SpecialFilter::HasNote => self.file_data.has_note(c.source_line),
-                        SpecialFilter::NoTags => !self.file_data.has_tags(c.source_line),
-                        SpecialFilter::NoNote => !self.file_data.has_note(c.source_line),
+                        SpecialFilter::HasAnyTag => file_data.has_tags(c.source_line),
+                        SpecialFilter::HasNote => file_data.has_note(c.source_line),
+                        SpecialFilter::NoTags => !file_data.has_tags(c.source_line),
+                        SpecialFilter::NoNote => !file_data.has_note(c.source_line),
                         SpecialFilter::HasTag(name) => {
                             // Check if conversation has the specific tag (in-memory lookup)
-                            self.file_data
+                            file_data
                                 .get_tags(c.source_line)
                                 .iter()
                                 .any(|t| t.name.to_lowercase() == *name)
@@ -534,7 +620,7 @@ impl App {
     }
 
     fn effective_indices(&self) -> Vec<usize> {
-        if self.search.query.is_empty() {
+        let mut indices = if self.search.query.is_empty() {
             self.filtered_indices.clone()
         } else {
             // Intersection of filtered and search matches
@@ -544,7 +630,34 @@ impl App {
                 .filter(|i| self.filtered_indices.contains(i))
                 .copied()
                 .collect()
+        };
+
+        // Apply sorting if active
+        if let (Some(field), order) = (&self.sort.field, self.sort.order) {
+            if order != SortOrder::None {
+                indices.sort_by(|&a, &b| {
+                    let val_a = self.conversations[a].metadata.fields.get(field)
+                        .and_then(|v| v.parse::<f64>().ok());
+                    let val_b = self.conversations[b].metadata.fields.get(field)
+                        .and_then(|v| v.parse::<f64>().ok());
+
+                    let cmp = match (val_a, val_b) {
+                        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(_), None) => std::cmp::Ordering::Less, // Values before None
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
+
+                    match order {
+                        SortOrder::Ascending => cmp,
+                        SortOrder::Descending => cmp.reverse(),
+                        SortOrder::None => std::cmp::Ordering::Equal,
+                    }
+                });
+            }
         }
+
+        indices
     }
 
     pub fn visible_conversations(&self) -> Vec<(usize, &Conversation)> {
@@ -591,6 +704,18 @@ impl App {
         let total = self.total_visible();
         if total > 0 {
             self.selected_index = total - 1;
+            self.scroll_offset = 0;
+            if self.notes.visible {
+                self.load_current_note();
+            }
+        }
+    }
+
+    /// Select a conversation by display index (for mouse clicks)
+    pub fn select_conversation(&mut self, index: usize) {
+        let total = self.total_visible();
+        if index < total {
+            self.selected_index = index;
             self.scroll_offset = 0;
             if self.notes.visible {
                 self.load_current_note();
@@ -829,23 +954,27 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    fn current_line_number(&self) -> Option<usize> {
-        self.selected_conversation().map(|c| c.source_line)
-    }
-
     fn load_current_note(&mut self) {
-        if let Some(line) = self.current_line_number() {
+        if let Some(conv) = self.selected_conversation() {
+            let line = conv.source_line;
+            let hash = conv.file_hash.clone();
             self.notes.content = self
-                .file_data
-                .get_note(line)
+                .file_data_map
+                .get(&hash)
+                .and_then(|fd| fd.get_note(line))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
         }
     }
 
     fn save_current_note(&mut self) {
-        if let Some(line) = self.current_line_number() {
-            self.file_data.set_note(line, self.notes.content.clone());
+        if let Some(conv) = self.selected_conversation() {
+            let line = conv.source_line;
+            let hash = conv.file_hash.clone();
+            let content = self.notes.content.clone();
+            if let Some(fd) = self.file_data_map.get_mut(&hash) {
+                fd.set_note(line, content);
+            }
         }
     }
 
@@ -862,8 +991,18 @@ impl App {
     }
 
     // Tags
+
+    /// Get global tags (from first file_data - they should all be the same)
+    fn get_global_tags(&self) -> Vec<Tag> {
+        self.file_data_map
+            .values()
+            .next()
+            .map(|fd| fd.tags.clone())
+            .unwrap_or_default()
+    }
+
     pub fn enter_tag_picker(&mut self) {
-        self.tag_picker.available_tags = self.file_data.tags.clone();
+        self.tag_picker.available_tags = self.get_global_tags();
         self.tag_picker.selected_index = 0;
         self.tag_picker.is_creating = false;
         self.tag_picker.new_tag_input.clear();
@@ -875,7 +1014,7 @@ impl App {
     }
 
     pub fn enter_tag_manager(&mut self) {
-        self.tag_picker.available_tags = self.file_data.tags.clone();
+        self.tag_picker.available_tags = self.get_global_tags();
         self.tag_picker.selected_index = 0;
         self.tag_picker.is_creating = false;
         self.tag_picker.new_tag_input.clear();
@@ -909,18 +1048,22 @@ impl App {
             return;
         };
 
-        // Get line numbers to operate on: marked conversations or current
-        let lines: Vec<usize> = if self.marked.is_empty() {
-            self.current_line_number().into_iter().collect()
+        // Get (file_hash, line) pairs to operate on: marked conversations or current
+        let targets: Vec<(String, usize)> = if self.marked.is_empty() {
+            self.selected_conversation()
+                .map(|c| vec![(c.file_hash.clone(), c.source_line)])
+                .unwrap_or_default()
         } else {
             self.marked
                 .iter()
-                .filter_map(|&idx| self.conversations.get(idx).map(|c| c.source_line))
+                .filter_map(|&idx| self.conversations.get(idx).map(|c| (c.file_hash.clone(), c.source_line)))
                 .collect()
         };
 
-        for line in lines {
-            self.file_data.toggle_tag(line, tag.id);
+        for (hash, line) in targets {
+            if let Some(fd) = self.file_data_map.get_mut(&hash) {
+                fd.toggle_tag(line, tag.id);
+            }
         }
     }
 
@@ -949,9 +1092,11 @@ impl App {
             if let Ok(tag) = self.db.create_tag(name) {
                 self.tag_picker.available_tags.push(tag.clone());
                 self.tag_picker.available_tags.sort_by(|a, b| a.name.cmp(&b.name));
-                // Also update file_data tags
-                self.file_data.tags.push(tag);
-                self.file_data.tags.sort_by(|a, b| a.name.cmp(&b.name));
+                // Update all file_data tags
+                for fd in self.file_data_map.values_mut() {
+                    fd.tags.push(tag.clone());
+                    fd.tags.sort_by(|a, b| a.name.cmp(&b.name));
+                }
             }
         }
         self.tag_picker.is_creating = false;
@@ -968,14 +1113,112 @@ impl App {
                 {
                     self.tag_picker.selected_index -= 1;
                 }
-                // Also remove from file_data tags
-                self.file_data.tags.retain(|t| t.id != tag.id);
-                // Remove this tag from all conversations in memory
-                for tags in self.file_data.conversation_tags.values_mut() {
-                    tags.remove(&tag.id);
+                // Remove from all file_data
+                for fd in self.file_data_map.values_mut() {
+                    fd.tags.retain(|t| t.id != tag.id);
+                    for tags in fd.conversation_tags.values_mut() {
+                        tags.remove(&tag.id);
+                    }
                 }
             }
         }
+    }
+
+    // Sort
+    pub fn enter_sort_picker(&mut self) {
+        self.sort.selected_index = 0;
+        // Pre-select current sort field if any
+        if let Some(ref field) = self.sort.field {
+            if let Some(pos) = self.metadata_fields.iter().position(|f| f == field) {
+                self.sort.selected_index = pos;
+            }
+        }
+        self.mode = Mode::SortPicker;
+    }
+
+    pub fn exit_sort_picker(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    pub fn sort_picker_next(&mut self) {
+        let len = self.metadata_fields.len();
+        if len > 0 {
+            self.sort.selected_index = (self.sort.selected_index + 1) % len;
+        }
+    }
+
+    pub fn sort_picker_prev(&mut self) {
+        let len = self.metadata_fields.len();
+        if len > 0 {
+            self.sort.selected_index = if self.sort.selected_index == 0 {
+                len - 1
+            } else {
+                self.sort.selected_index - 1
+            };
+        }
+    }
+
+    pub fn toggle_selected_sort(&mut self) {
+        if let Some(field) = self.metadata_fields.get(self.sort.selected_index).cloned() {
+            if self.sort.field.as_ref() == Some(&field) {
+                // Same field - toggle order
+                self.sort.order = self.sort.order.toggle();
+                if self.sort.order == SortOrder::None {
+                    self.sort.field = None;
+                }
+            } else {
+                // Different field - start ascending
+                self.sort.field = Some(field);
+                self.sort.order = SortOrder::Ascending;
+            }
+            self.selected_index = 0;
+        }
+    }
+
+    pub fn clear_sort(&mut self) {
+        self.sort.field = None;
+        self.sort.order = SortOrder::None;
+        self.selected_index = 0;
+    }
+
+    // Collapse mode
+    pub fn cycle_collapse_mode(&mut self) {
+        self.collapse_mode = self.collapse_mode.cycle();
+    }
+
+    // Panel resize
+    pub fn increase_list_width(&mut self) {
+        if self.list_panel_width < 50 {
+            self.list_panel_width += 5;
+        }
+    }
+
+    pub fn decrease_list_width(&mut self) {
+        if self.list_panel_width > 15 {
+            self.list_panel_width -= 5;
+        }
+    }
+
+    // Quit
+    pub fn request_quit(&mut self) {
+        if self.has_unsaved_changes() {
+            self.mode = Mode::ConfirmQuit;
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    pub fn confirm_quit_save(&mut self) {
+        self.save();
+        self.should_quit = true;
+    }
+
+    pub fn confirm_quit_discard(&mut self) {
+        self.should_quit = true;
+    }
+
+    pub fn cancel_quit(&mut self) {
+        self.mode = Mode::Normal;
     }
 
     // Help
@@ -1029,6 +1272,8 @@ mod tests {
                 content: "test".to_string(),
             }],
             source_line: 1,
+            source_file: "test.jsonl".to_string(),
+            file_hash: "abc123".to_string(),
             metadata,
             preview_text: None,
         };

@@ -56,6 +56,8 @@ impl Metadata {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub source_line: usize,
+    pub source_file: String,  // Path to the source file
+    pub file_hash: String,    // Hash of the source file
     pub metadata: Metadata,
     pub preview_text: Option<String>,
 }

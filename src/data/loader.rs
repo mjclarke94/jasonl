@@ -25,6 +25,8 @@ pub fn load_conversations<P: AsRef<Path>>(
     path: P,
     schema: Option<&Schema>,
     metadata_fields: &[String],
+    source_file: &str,
+    file_hash: &str,
 ) -> Result<Vec<Conversation>> {
     let path = path.as_ref();
     let file =
@@ -43,9 +45,9 @@ pub fn load_conversations<P: AsRef<Path>>(
         }
 
         let conv = if let Some(schema) = schema {
-            parse_custom_format(line, line_num + 1, schema)
+            parse_custom_format(line, line_num + 1, schema, source_file, file_hash)
         } else {
-            parse_standard_format(line, line_num + 1, metadata_fields)
+            parse_standard_format(line, line_num + 1, metadata_fields, source_file, file_hash)
         };
 
         match conv {
@@ -63,6 +65,8 @@ fn parse_standard_format(
     line: &str,
     line_num: usize,
     metadata_fields: &[String],
+    source_file: &str,
+    file_hash: &str,
 ) -> Result<Conversation> {
     let value: Value =
         serde_json::from_str(line).context("Failed to parse as standard message format")?;
@@ -90,12 +94,20 @@ fn parse_standard_format(
     Ok(Conversation {
         messages: entry.messages,
         source_line: line_num,
+        source_file: source_file.to_string(),
+        file_hash: file_hash.to_string(),
         metadata,
         preview_text: None,
     })
 }
 
-fn parse_custom_format(line: &str, line_num: usize, schema: &Schema) -> Result<Conversation> {
+fn parse_custom_format(
+    line: &str,
+    line_num: usize,
+    schema: &Schema,
+    source_file: &str,
+    file_hash: &str,
+) -> Result<Conversation> {
     let obj: Value = serde_json::from_str(line).context("Failed to parse JSON")?;
     let obj = obj
         .as_object()
@@ -163,6 +175,8 @@ fn parse_custom_format(line: &str, line_num: usize, schema: &Schema) -> Result<C
     Ok(Conversation {
         messages,
         source_line: line_num,
+        source_file: source_file.to_string(),
+        file_hash: file_hash.to_string(),
         metadata,
         preview_text,
     })
@@ -221,9 +235,11 @@ mod tests {
             "metadata.condition".to_string(),
         ];
 
-        let conv = parse_standard_format(line, 1, &metadata_fields).unwrap();
+        let conv = parse_standard_format(line, 1, &metadata_fields, "test.jsonl", "abc123").unwrap();
 
         assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.source_file, "test.jsonl");
+        assert_eq!(conv.file_hash, "abc123");
         assert_eq!(
             conv.metadata.fields.get("evaluation.alignment_score"),
             Some(&"90".to_string())
