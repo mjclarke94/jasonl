@@ -10,7 +10,7 @@ use crate::app::{App, CollapseMode, Mode};
 use crate::data::Role;
 use crate::streaming_loader::StreamingLoader;
 
-pub fn draw(frame: &mut Frame, app: &App, loader: Option<&StreamingLoader>) {
+pub fn draw(frame: &mut Frame, app: &mut App, loader: Option<&StreamingLoader>) {
     // Determine if we need stats bar
     let show_stats = app.is_filtered_view() && !app.global_stats.fields.is_empty();
 
@@ -76,12 +76,22 @@ pub fn draw(frame: &mut Frame, app: &App, loader: Option<&StreamingLoader>) {
     }
 }
 
-fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
-    let visible = app.visible_conversations();
-    let items: Vec<ListItem> = visible
+fn draw_conversation_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Calculate viewport height (area height minus 2 for borders)
+    let viewport_height = area.height.saturating_sub(2) as usize;
+
+    // Update app's cached viewport height for page up/down
+    app.list_viewport_height = viewport_height;
+
+    // Get total count once (O(1) with Rc cache)
+    let total_visible = app.total_visible();
+
+    // Only get conversations visible in viewport (O(viewport_height) instead of O(n))
+    let (viewport_start, viewport_items) = app.viewport_conversations(viewport_height);
+
+    let items: Vec<ListItem> = viewport_items
         .iter()
-        .enumerate()
-        .map(|(display_idx, (actual_idx, conv))| {
+        .map(|(display_idx, actual_idx, conv)| {
             let preview = conv.preview();
             let is_marked = app.is_marked(*actual_idx);
             let (has_tags, has_note) = app.file_data_map
@@ -95,7 +105,7 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
             let note_char = if has_note { "N" } else { " " };
             let text = format!("{}{}{} {}", mark_char, tag_char, note_char, preview);
 
-            let mut style = if display_idx == app.selected_index {
+            let mut style = if *display_idx == app.selected_index {
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)
@@ -115,23 +125,23 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
     let title = if marked_count > 0 {
         format!(
             " Conversations ({}/{}) [{} marked] ",
-            if app.total_visible() > 0 {
+            if total_visible > 0 {
                 app.selected_index + 1
             } else {
                 0
             },
-            app.total_visible(),
+            total_visible,
             marked_count
         )
     } else {
         format!(
             " Conversations ({}/{}) ",
-            if app.total_visible() > 0 {
+            if total_visible > 0 {
                 app.selected_index + 1
             } else {
                 0
             },
-            app.total_visible()
+            total_visible
         )
     };
 
@@ -139,8 +149,10 @@ fn draw_conversation_list(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().bg(Color::DarkGray));
 
+    // Select relative to viewport (selected_index - viewport_start)
     let mut state = ListState::default();
-    state.select(Some(app.selected_index));
+    let relative_selected = app.selected_index.saturating_sub(viewport_start);
+    state.select(Some(relative_selected));
 
     frame.render_stateful_widget(list, area, &mut state);
 }

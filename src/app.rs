@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::io::{self, Write};
 
 use arboard::Clipboard;
@@ -328,8 +329,10 @@ pub struct App {
     filtered_indices: HashSet<usize>,
     /// Current filter progress (index into conversations), None = filter complete
     filter_progress: Option<usize>,
-    // Cached effective indices (sorted, filtered, searched)
-    cached_effective_indices: Option<Vec<usize>>,
+    // Cached effective indices (sorted, filtered, searched) - uses Rc for cheap cloning
+    cached_effective_indices: Option<Rc<Vec<usize>>>,
+    // Cached stats for current filter/search view (only recomputed when filter/search changes)
+    cached_current_stats: Option<MetadataStats>,
     // Global statistics for all conversations
     pub global_stats: MetadataStats,
     // All unique metadata field names for autocompletion
@@ -346,6 +349,8 @@ pub struct App {
     pub tag_picker: TagPickerState,
     // UI panel widths (as percentages)
     pub list_panel_width: u16, // Default 25%
+    // Cached list viewport height for page up/down (updated by UI)
+    pub list_viewport_height: usize,
     // Message collapse mode
     pub collapse_mode: CollapseMode,
     // Trigram search index (optional, built on demand)
@@ -372,6 +377,7 @@ impl App {
             filtered_indices: HashSet::new(),
             filter_progress: None,
             cached_effective_indices: None,
+            cached_current_stats: None,
             global_stats: MetadataStats::default(),
             metadata_fields: Vec::new(),
             marked: HashSet::new(),
@@ -380,6 +386,7 @@ impl App {
             notes: NotesState::default(),
             tag_picker: TagPickerState::default(),
             list_panel_width: 25,
+            list_viewport_height: 20, // Default, updated by UI
             collapse_mode: CollapseMode::default(),
             trigram_index: None,
             index_builder: None,
@@ -466,6 +473,7 @@ impl App {
             filtered_indices,
             filter_progress: None,
             cached_effective_indices: None,
+            cached_current_stats: None,
             global_stats,
             metadata_fields,
             marked: HashSet::new(),
@@ -474,6 +482,7 @@ impl App {
             notes: NotesState::default(),
             tag_picker: TagPickerState::default(),
             list_panel_width: 25,
+            list_viewport_height: 20, // Default, updated by UI
             collapse_mode: CollapseMode::default(),
             trigram_index: None,
             index_builder: None,
@@ -497,8 +506,13 @@ impl App {
         self.file_data_map.values().any(|fd| fd.is_dirty())
     }
 
-    /// Calculate statistics for currently visible conversations
+    /// Get statistics for currently visible conversations (cached, only recomputed when filter/search changes)
     pub fn current_stats(&self) -> MetadataStats {
+        // Return cached stats if available
+        if let Some(ref cached) = self.cached_current_stats {
+            return cached.clone();
+        }
+        // Fallback to computing (shouldn't happen if update_effective_cache is called properly)
         let visible_convs = self.effective_indices();
         MetadataStats::from_conversations(visible_convs.iter().map(|&i| &self.conversations[i]))
     }
@@ -573,16 +587,17 @@ impl App {
             .and_then(|&i| self.conversations.get(i))
     }
 
-    /// Invalidate the cached effective indices (call when filter/search/sort changes)
+    /// Invalidate the cached effective indices and stats (call when filter/search/sort changes)
     fn invalidate_effective_cache(&mut self) {
         self.cached_effective_indices = None;
+        self.cached_current_stats = None;
     }
 
-    /// Get effective indices, using cache when possible
-    fn effective_indices(&self) -> Vec<usize> {
-        // Return cached version if available
+    /// Get effective indices, using cache when possible (Rc for cheap cloning)
+    fn effective_indices(&self) -> Rc<Vec<usize>> {
+        // Return cached version if available (Rc clone is O(1))
         if let Some(ref cached) = self.cached_effective_indices {
-            return cached.clone();
+            return Rc::clone(cached);
         }
 
         // Compute indices
@@ -623,20 +638,48 @@ impl App {
             }
         }
 
-        indices
+        Rc::new(indices)
     }
 
     /// Update the effective indices cache (call after search/filter/sort changes stabilize)
     pub fn update_effective_cache(&mut self) {
+        self.cached_effective_indices = None; // Clear first to avoid borrow issues
+        self.cached_current_stats = None;
         let indices = self.effective_indices();
+        // Compute stats while we have the indices
+        let stats = MetadataStats::from_conversations(indices.iter().map(|&i| &self.conversations[i]));
         self.cached_effective_indices = Some(indices);
+        self.cached_current_stats = Some(stats);
     }
 
-    pub fn visible_conversations(&self) -> Vec<(usize, &Conversation)> {
-        self.effective_indices()
-            .iter()
-            .map(|&i| (i, &self.conversations[i]))
-            .collect()
+    /// Get only the conversations visible in the viewport (O(viewport_height) instead of O(n))
+    /// Returns (start_index, Vec of (display_idx, actual_idx, &Conversation))
+    pub fn viewport_conversations(&self, viewport_height: usize) -> (usize, Vec<(usize, usize, &Conversation)>) {
+        let indices = self.effective_indices();
+        let total = indices.len();
+
+        if total == 0 || viewport_height == 0 {
+            return (0, Vec::new());
+        }
+
+        // Calculate scroll offset to keep selected item visible (same logic as ratatui List)
+        let selected = self.selected_index.min(total.saturating_sub(1));
+        let start = if selected >= viewport_height {
+            // Selected item is below the viewport, scroll down
+            selected.saturating_sub(viewport_height - 1)
+        } else {
+            0
+        };
+        let end = (start + viewport_height).min(total);
+
+        let items = (start..end)
+            .map(|display_idx| {
+                let actual_idx = indices[display_idx];
+                (display_idx, actual_idx, &self.conversations[actual_idx])
+            })
+            .collect();
+
+        (start, items)
     }
 
     pub fn total_visible(&self) -> usize {
@@ -680,6 +723,27 @@ impl App {
             if self.notes.visible {
                 self.load_current_note();
             }
+        }
+    }
+
+    /// Move down by a full page in the conversation list
+    pub fn page_down_conversations(&mut self, page_size: usize) {
+        let total = self.total_visible();
+        if total > 0 {
+            self.selected_index = (self.selected_index + page_size).min(total - 1);
+            self.scroll_offset = 0;
+            if self.notes.visible {
+                self.load_current_note();
+            }
+        }
+    }
+
+    /// Move up by a full page in the conversation list
+    pub fn page_up_conversations(&mut self, page_size: usize) {
+        self.selected_index = self.selected_index.saturating_sub(page_size);
+        self.scroll_offset = 0;
+        if self.notes.visible {
+            self.load_current_note();
         }
     }
 
@@ -1094,7 +1158,7 @@ impl App {
     /// Mark all currently visible conversations
     pub fn select_all_visible(&mut self) {
         let indices = self.effective_indices();
-        for idx in indices {
+        for &idx in indices.iter() {
             self.marked.insert(idx);
         }
     }

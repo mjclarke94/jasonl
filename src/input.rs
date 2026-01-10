@@ -22,8 +22,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => app.request_quit(),
         KeyCode::Char('j') | KeyCode::Down => app.next_conversation(),
         KeyCode::Char('k') | KeyCode::Up => app.prev_conversation(),
-        KeyCode::Char('J') | KeyCode::PageDown => app.scroll_down(10),
-        KeyCode::Char('K') | KeyCode::PageUp => app.scroll_up(10),
+        KeyCode::Char('J') => app.scroll_down(10),
+        KeyCode::Char('K') => app.scroll_up(10),
+        KeyCode::Right | KeyCode::PageDown => {
+            let page_size = app.list_viewport_height;
+            app.page_down_conversations(page_size);
+        }
+        KeyCode::Left | KeyCode::PageUp => {
+            let page_size = app.list_viewport_height;
+            app.page_up_conversations(page_size);
+        }
         KeyCode::Char('g') => app.first_conversation(),
         KeyCode::Char('G') => app.last_conversation(),
         KeyCode::Char('/') => app.enter_search_mode(),
