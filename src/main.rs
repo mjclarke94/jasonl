@@ -1,7 +1,10 @@
 mod app;
 mod data;
 mod db;
+mod filter_expr;
 mod input;
+mod search_index;
+mod streaming_loader;
 mod ui;
 
 use std::io;
@@ -17,8 +20,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
-use data::{load_conversations, Schema};
-use db::{hash_file, Database};
+use db::Database;
 use input::{handle_key_event, handle_mouse_event};
 
 #[derive(Parser)]
@@ -61,7 +63,7 @@ fn main() -> Result<()> {
     let metadata_fields = cli.metadata.unwrap_or_default();
 
     let schema = if cli.user_field.is_some() || cli.assistant_field.is_some() {
-        Some(Schema {
+        Some(data::Schema {
             user_field: cli.user_field.unwrap_or_else(|| "question".to_string()),
             assistant_field: cli.assistant_field.unwrap_or_else(|| "response".to_string()),
             system_field: cli.system_field,
@@ -72,38 +74,25 @@ fn main() -> Result<()> {
         None
     };
 
-    // Load conversations from all files
-    let mut all_conversations = Vec::new();
-    let mut file_hashes = std::collections::HashMap::new();
-
-    for file in &cli.files {
-        let file_hash = hash_file(file)?;
-        file_hashes.insert(file.clone(), file_hash.clone());
-
-        match load_conversations(file, schema.as_ref(), &metadata_fields, file, &file_hash) {
-            Ok(convs) => {
-                if convs.is_empty() {
-                    eprintln!("Warning: No conversations found in {}", file);
-                } else {
-                    all_conversations.extend(convs);
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to load {}: {}", file, e);
-            }
+    // Create streaming loader (supports glob patterns)
+    let loader = match streaming_loader::StreamingLoader::new(
+        cli.files.clone(),
+        schema,
+        metadata_fields,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(());
         }
-    }
+    };
 
-    if all_conversations.is_empty() {
-        eprintln!("No conversations found in any file");
-        return Ok(());
-    }
-
-    // Create display path (single file or "N files")
-    let display_path = if cli.files.len() == 1 {
+    // Create display path
+    let display_path = if cli.files.len() == 1 && !cli.files[0].contains('*') {
         cli.files[0].clone()
     } else {
-        format!("{} files", cli.files.len())
+        let (_, total, _) = loader.progress();
+        format!("{} files", total)
     };
 
     // Open database for notes and tags
@@ -116,12 +105,14 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(all_conversations, display_path, file_hashes, database);
-    let result = run_app(&mut terminal, &mut app);
+    // Start with empty app, load incrementally
+    let mut app = App::new_empty(display_path, database);
+    let result = run_app(&mut terminal, &mut app, Some(loader));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
 
+    // Show any loading errors after exit
     if let Err(e) = result {
         eprintln!("Error: {}", e);
     }
@@ -129,12 +120,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    loop {
-        let frame_size = terminal.get_frame().area();
-        terminal.draw(|frame| ui::draw(frame, app))?;
+/// Batch size for incremental search/filter/loading processing
+const BATCH_SIZE: usize = 10_000;
 
-        if event::poll(Duration::from_millis(100))? {
+/// Loading batch size (smaller for more responsive UI during initial load)
+const LOAD_BATCH_SIZE: usize = 1_000;
+
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    mut loader: Option<streaming_loader::StreamingLoader>,
+) -> Result<()> {
+    // Store loading errors to display after app exits
+    let mut loading_errors: Vec<streaming_loader::LoadError> = Vec::new();
+
+    loop {
+        // Process file loading
+        let loading_pending = if let Some(ref mut l) = loader {
+            let (new_convs, has_more) = l.load_batch(LOAD_BATCH_SIZE);
+            if !new_convs.is_empty() {
+                app.add_conversations(new_convs, &l.file_hashes);
+            }
+            if !has_more {
+                // Loading complete - capture errors before dropping loader
+                loading_errors = std::mem::take(&mut l.stats.errors);
+                loader = None;
+            }
+            has_more
+        } else {
+            false
+        };
+
+        // Process pending search/filter/index work
+        let search_pending = app.continue_search(BATCH_SIZE);
+        let filter_pending = app.continue_filter(BATCH_SIZE);
+        let index_pending = app.continue_index_build(BATCH_SIZE);
+        let has_pending_work = loading_pending || search_pending || filter_pending || index_pending;
+
+        let frame_size = terminal.get_frame().area();
+        terminal.draw(|frame| ui::draw(frame, app, loader.as_ref()))?;
+
+        // Use shorter poll timeout if work is pending to stay responsive
+        let timeout = if has_pending_work {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(100)
+        };
+
+        if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => handle_key_event(app, key),
                 Event::Mouse(mouse) => handle_mouse_event(app, mouse, frame_size),
@@ -144,6 +177,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
         if app.should_quit {
             break;
+        }
+    }
+
+    // Print loading errors on exit
+    for err in &loading_errors {
+        if let Some(line) = err.line {
+            eprintln!("Warning: {}:{}: {}", err.file, line, err.message);
+        } else {
+            eprintln!("Warning: {}: {}", err.file, err.message);
         }
     }
 

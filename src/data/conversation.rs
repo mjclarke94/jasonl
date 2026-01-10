@@ -60,6 +60,8 @@ pub struct Conversation {
     pub file_hash: String,    // Hash of the source file
     pub metadata: Metadata,
     pub preview_text: Option<String>,
+    /// Pre-computed lowercase text for fast case-insensitive search
+    pub search_text: String,
 }
 
 impl Conversation {
@@ -87,11 +89,11 @@ impl Conversation {
         }
     }
 
-    pub fn contains(&self, query: &str) -> bool {
-        let query_lower = query.to_lowercase();
-        self.messages
-            .iter()
-            .any(|m| m.content.to_lowercase().contains(&query_lower))
+    /// Check if conversation contains the query (case-insensitive).
+    /// Query must already be lowercased for performance.
+    /// Uses SIMD-optimized search via memchr.
+    pub fn contains(&self, query_lower: &str) -> bool {
+        crate::search_index::contains_fast(&self.search_text, query_lower)
     }
 
     /// Convert to JSONL format (single line JSON)

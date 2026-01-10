@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A TUI viewer for JSONL LLM conversation files"
 
+[[bin]]
+name = "search_bench"
+path = "benches/search_bench.rs"
+
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
@@ -16,3 +20,5 @@ base64 = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 dirs = "5.0"
+memchr = "2.7.6"
+glob = "0.3.3"

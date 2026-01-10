@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use arboard::Clipboard;
@@ -6,6 +6,8 @@ use base64::Engine;
 
 use crate::data::Conversation;
 use crate::db::{Database, FileData, Tag};
+use crate::filter_expr::{CompareOp, FilterExpr, Value};
+use crate::search_index::{SortedFieldIndex, TrigramIndex, TrigramIndexBuilder};
 
 /// Check if we're running in an SSH session
 fn is_ssh_session() -> bool {
@@ -98,6 +100,18 @@ impl MetadataStats {
     pub fn get_avg(&self, field: &str) -> Option<f64> {
         self.fields.get(field).and_then(|s| s.avg())
     }
+
+    /// Update stats with a single conversation (for incremental loading)
+    pub fn update_with_conversation(&mut self, conv: &Conversation) {
+        for (key, value) in &conv.metadata.fields {
+            if let Ok(num) = value.parse::<f64>() {
+                self.fields
+                    .entry(key.clone())
+                    .or_insert_with(FieldStats::new)
+                    .add(num);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,158 +160,11 @@ pub struct SortState {
     pub selected_index: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FilterOp {
-    Gt,
-    Lt,
-    Gte,
-    Lte,
-    Eq,
-    Neq,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum FilterValue {
-    Number(f64),
-    Bool(bool),
-}
-
-#[derive(Debug, Clone)]
-pub struct Filter {
-    pub field: String,
-    pub op: FilterOp,
-    pub value: FilterValue,
-}
-
-impl Filter {
-    pub fn parse(expr: &str) -> Option<Self> {
-        let expr = expr.trim();
-
-        // Try each operator (longer ones first to avoid partial matches)
-        let operators = [
-            (">=", FilterOp::Gte),
-            ("<=", FilterOp::Lte),
-            ("!=", FilterOp::Neq),
-            (">", FilterOp::Gt),
-            ("<", FilterOp::Lt),
-            ("=", FilterOp::Eq),
-        ];
-
-        for (op_str, op) in operators {
-            if let Some(pos) = expr.find(op_str) {
-                let field = expr[..pos].trim().to_string();
-                let value_str = expr[pos + op_str.len()..].trim();
-
-                if field.is_empty() {
-                    return None;
-                }
-
-                // Try parsing as number first
-                if let Ok(value) = value_str.parse::<f64>() {
-                    return Some(Filter {
-                        field,
-                        op,
-                        value: FilterValue::Number(value),
-                    });
-                }
-
-                // Try parsing as boolean
-                match value_str.to_lowercase().as_str() {
-                    "true" => {
-                        return Some(Filter {
-                            field,
-                            op,
-                            value: FilterValue::Bool(true),
-                        });
-                    }
-                    "false" => {
-                        return Some(Filter {
-                            field,
-                            op,
-                            value: FilterValue::Bool(false),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
-    pub fn matches(&self, conv: &Conversation) -> bool {
-        let Some(field_value) = conv.metadata.fields.get(&self.field) else {
-            return false;
-        };
-
-        match &self.value {
-            FilterValue::Number(filter_num) => {
-                let Ok(num_value) = field_value.parse::<f64>() else {
-                    return false;
-                };
-
-                match self.op {
-                    FilterOp::Gt => num_value > *filter_num,
-                    FilterOp::Lt => num_value < *filter_num,
-                    FilterOp::Gte => num_value >= *filter_num,
-                    FilterOp::Lte => num_value <= *filter_num,
-                    FilterOp::Eq => (num_value - filter_num).abs() < f64::EPSILON,
-                    FilterOp::Neq => (num_value - filter_num).abs() >= f64::EPSILON,
-                }
-            }
-            FilterValue::Bool(filter_bool) => {
-                let field_bool = match field_value.to_lowercase().as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => return false,
-                };
-
-                match self.op {
-                    FilterOp::Eq => field_bool == *filter_bool,
-                    FilterOp::Neq => field_bool != *filter_bool,
-                    // Other operators don't make sense for booleans
-                    _ => false,
-                }
-            }
-        }
-    }
-}
-
-/// Special filters for tags and notes
-#[derive(Debug, Clone)]
-pub enum SpecialFilter {
-    HasTag(String),    // tag:name - has specific tag
-    HasAnyTag,         // has:tags - has any tag
-    HasNote,           // has:notes - has a note
-    NoTags,            // no:tags - has no tags
-    NoNote,            // no:notes - has no note
-}
-
-impl SpecialFilter {
-    pub fn parse(expr: &str) -> Option<Self> {
-        let expr = expr.trim().to_lowercase();
-
-        if let Some(tag_name) = expr.strip_prefix("tag:") {
-            let tag_name = tag_name.trim();
-            if !tag_name.is_empty() {
-                return Some(SpecialFilter::HasTag(tag_name.to_string()));
-            }
-        }
-
-        match expr.as_str() {
-            "has:tags" | "has:tag" => Some(SpecialFilter::HasAnyTag),
-            "has:notes" | "has:note" => Some(SpecialFilter::HasNote),
-            "no:tags" | "no:tag" => Some(SpecialFilter::NoTags),
-            "no:notes" | "no:note" => Some(SpecialFilter::NoNote),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct FilterState {
     pub expression: String,
-    pub filters: Vec<Filter>,
-    pub special_filters: Vec<SpecialFilter>,
+    /// Parsed filter expression (None if empty or error)
+    pub parsed: Option<crate::filter_expr::FilterExpr>,
     pub error: Option<String>,
     // Completion state
     completion_prefix: String,
@@ -307,44 +174,25 @@ pub struct FilterState {
 
 impl FilterState {
     pub fn is_active(&self) -> bool {
-        !self.filters.is_empty() || !self.special_filters.is_empty()
+        self.parsed.as_ref().map_or(false, |p| !matches!(p, crate::filter_expr::FilterExpr::True))
     }
 
     pub fn update(&mut self) {
-        self.filters.clear();
-        self.special_filters.clear();
+        self.parsed = None;
         self.error = None;
 
         if self.expression.trim().is_empty() {
             return;
         }
 
-        // Split by AND (case-insensitive) or comma
-        let parts: Vec<&str> = self.expression
-            .split([',', '&'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty() && *s != "AND" && *s != "and")
-            .collect();
-
-        for part in parts {
-            // Try special filter first
-            if let Some(special) = SpecialFilter::parse(part) {
-                self.special_filters.push(special);
-            } else if let Some(filter) = Filter::parse(part) {
-                self.filters.push(filter);
-            } else if !part.is_empty() {
-                self.error = Some(format!("Invalid filter: {}", part));
-                return;
+        match crate::filter_expr::FilterExpr::parse(&self.expression) {
+            Ok(expr) => {
+                self.parsed = Some(expr);
+            }
+            Err(e) => {
+                self.error = Some(e);
             }
         }
-    }
-
-    pub fn matches(&self, conv: &Conversation) -> bool {
-        if self.filters.is_empty() && self.special_filters.is_empty() {
-            return true;
-        }
-        self.filters.iter().all(|f| f.matches(conv))
-        // Note: special filters are checked separately in App::filter_matches
     }
 
     /// Reset completion state (call when expression changes via typing)
@@ -415,8 +263,12 @@ impl FilterState {
 #[derive(Debug, Default)]
 pub struct SearchState {
     pub query: String,
+    /// Pre-lowercased query for fast comparison
+    pub query_lower: String,
     pub matches: Vec<usize>,
     pub current_match: usize,
+    /// Current search progress (index into conversations), None = search complete
+    pub search_progress: Option<usize>,
 }
 
 /// State for notes editing
@@ -472,14 +324,18 @@ pub struct App {
     pub filter: FilterState,
     pub sort: SortState,
     pub should_quit: bool,
-    // Cached indices of conversations matching current filter
-    filtered_indices: Vec<usize>,
+    // Cached indices of conversations matching current filter (HashSet for O(1) lookup)
+    filtered_indices: HashSet<usize>,
+    /// Current filter progress (index into conversations), None = filter complete
+    filter_progress: Option<usize>,
+    // Cached effective indices (sorted, filtered, searched)
+    cached_effective_indices: Option<Vec<usize>>,
     // Global statistics for all conversations
     pub global_stats: MetadataStats,
     // All unique metadata field names for autocompletion
     pub metadata_fields: Vec<String>,
     // Multi-select: indices of marked conversations
-    pub marked: std::collections::HashSet<usize>,
+    pub marked: HashSet<usize>,
     // Database for notes and tags
     pub db: Database,
     // In-memory cache of tag/note data per file (keyed by file_hash)
@@ -492,25 +348,103 @@ pub struct App {
     pub list_panel_width: u16, // Default 25%
     // Message collapse mode
     pub collapse_mode: CollapseMode,
+    // Trigram search index (optional, built on demand)
+    trigram_index: Option<TrigramIndex>,
+    // Index builder (when building in progress)
+    index_builder: Option<TrigramIndexBuilder>,
+    // Sorted field indices for O(log n) range queries (built on demand)
+    field_indices: HashMap<String, SortedFieldIndex>,
 }
 
 impl App {
+    /// Create an empty App for streaming loading
+    pub fn new_empty(file_path: String, db: Database) -> Self {
+        Self {
+            conversations: Vec::new(),
+            selected_index: 0,
+            scroll_offset: 0,
+            mode: Mode::Normal,
+            file_path,
+            search: SearchState::default(),
+            filter: FilterState::default(),
+            sort: SortState::default(),
+            should_quit: false,
+            filtered_indices: HashSet::new(),
+            filter_progress: None,
+            cached_effective_indices: None,
+            global_stats: MetadataStats::default(),
+            metadata_fields: Vec::new(),
+            marked: HashSet::new(),
+            db,
+            file_data_map: HashMap::new(),
+            notes: NotesState::default(),
+            tag_picker: TagPickerState::default(),
+            list_panel_width: 25,
+            collapse_mode: CollapseMode::default(),
+            trigram_index: None,
+            index_builder: None,
+            field_indices: HashMap::new(),
+        }
+    }
+
+    /// Add new conversations (from streaming loader)
+    pub fn add_conversations(&mut self, new_convs: Vec<Conversation>, _file_hashes: &HashMap<String, String>) {
+        let _start_idx = self.conversations.len();
+
+        for conv in new_convs {
+            let idx = self.conversations.len();
+
+            // Load file data for new file hashes
+            if !self.file_data_map.contains_key(&conv.file_hash) {
+                let mut file_data = self.db.load_file_data(&conv.file_hash).unwrap_or_else(|_| {
+                    FileData::new(vec![], HashMap::new(), HashMap::new())
+                });
+                file_data.snapshot_original();
+                self.file_data_map.insert(conv.file_hash.clone(), file_data);
+            }
+
+            // Collect new metadata fields
+            for key in conv.metadata.fields.keys() {
+                if !self.metadata_fields.contains(key) {
+                    self.metadata_fields.push(key.clone());
+                }
+            }
+
+            // Update global stats incrementally
+            self.global_stats.update_with_conversation(&conv);
+
+            self.conversations.push(conv);
+
+            // Add to filtered indices if no filter active, or if matches filter
+            if !self.filter.is_active() || self.conversation_matches_filter(&self.conversations[idx]) {
+                self.filtered_indices.insert(idx);
+            }
+        }
+
+        // Sort metadata fields
+        self.metadata_fields.sort();
+
+        // Invalidate caches since indices changed
+        self.invalidate_effective_cache();
+        self.invalidate_field_indices();
+    }
+
     pub fn new(conversations: Vec<Conversation>, file_path: String, file_hashes: HashMap<String, String>, db: Database) -> Self {
-        let filtered_indices: Vec<usize> = (0..conversations.len()).collect();
+        let filtered_indices: HashSet<usize> = (0..conversations.len()).collect();
         let global_stats = MetadataStats::from_conversations(conversations.iter());
 
         // Collect unique metadata field names for autocompletion
         let mut metadata_fields: Vec<String> = conversations
             .iter()
             .flat_map(|c| c.metadata.fields.keys().cloned())
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         metadata_fields.sort();
 
         // Load all tag/note data into memory for each unique file hash
         let mut file_data_map: HashMap<String, FileData> = HashMap::new();
-        let unique_hashes: std::collections::HashSet<_> = file_hashes.values().cloned().collect();
+        let unique_hashes: HashSet<_> = file_hashes.values().cloned().collect();
         for hash in unique_hashes {
             let mut file_data = db.load_file_data(&hash).unwrap_or_else(|_| {
                 FileData::new(vec![], HashMap::new(), HashMap::new())
@@ -530,15 +464,20 @@ impl App {
             sort: SortState::default(),
             should_quit: false,
             filtered_indices,
+            filter_progress: None,
+            cached_effective_indices: None,
             global_stats,
             metadata_fields,
-            marked: std::collections::HashSet::new(),
+            marked: HashSet::new(),
             db,
             file_data_map,
             notes: NotesState::default(),
             tag_picker: TagPickerState::default(),
             list_panel_width: 25,
             collapse_mode: CollapseMode::default(),
+            trigram_index: None,
+            index_builder: None,
+            field_indices: HashMap::new(),
         }
     }
 
@@ -569,47 +508,62 @@ impl App {
         !self.search.query.is_empty() || self.filter.is_active()
     }
 
+    /// Reset filter to include all conversations (for incremental rebuilding)
+    fn reset_filter(&mut self) {
+        self.filtered_indices.clear();
+        self.filter_progress = Some(0);
+        self.invalidate_effective_cache();
+    }
+
+    /// Check if a conversation matches current filters
+    fn conversation_matches_filter(&self, conv: &Conversation) -> bool {
+        // If no parsed filter, include all
+        let Some(ref expr) = self.filter.parsed else {
+            return true;
+        };
+
+        // Get file data for this conversation (for tag/note filters)
+        let file_data = self.file_data_map.get(&conv.file_hash);
+
+        expr.matches(conv, file_data)
+    }
+
+    /// Continue incremental filter processing. Returns true if more work remains.
+    pub fn continue_filter(&mut self, batch_size: usize) -> bool {
+        let Some(start) = self.filter_progress else {
+            return false;
+        };
+
+        let end = (start + batch_size).min(self.conversations.len());
+
+        for i in start..end {
+            if self.conversation_matches_filter(&self.conversations[i]) {
+                self.filtered_indices.insert(i);
+            }
+        }
+
+        if end >= self.conversations.len() {
+            self.filter_progress = None;
+            self.update_effective_cache(); // Rebuild cache on completion
+            false
+        } else {
+            self.filter_progress = Some(end);
+            self.invalidate_effective_cache(); // Invalidate during incremental work
+            true
+        }
+    }
+
+    /// Full (blocking) filter update - used when we need immediate results
     fn update_filtered_indices(&mut self) {
         self.filtered_indices = self
             .conversations
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
-                // Check regular metadata filters
-                if !self.filter.matches(c) {
-                    return false;
-                }
-
-                // Get file data for this conversation
-                let file_data = match self.file_data_map.get(&c.file_hash) {
-                    Some(fd) => fd,
-                    None => return true, // No file data means no tags/notes to filter on
-                };
-
-                // Check special filters (all in-memory, fast)
-                for special in &self.filter.special_filters {
-                    let matches = match special {
-                        SpecialFilter::HasAnyTag => file_data.has_tags(c.source_line),
-                        SpecialFilter::HasNote => file_data.has_note(c.source_line),
-                        SpecialFilter::NoTags => !file_data.has_tags(c.source_line),
-                        SpecialFilter::NoNote => !file_data.has_note(c.source_line),
-                        SpecialFilter::HasTag(name) => {
-                            // Check if conversation has the specific tag (in-memory lookup)
-                            file_data
-                                .get_tags(c.source_line)
-                                .iter()
-                                .any(|t| t.name.to_lowercase() == *name)
-                        }
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-
-                true
-            })
+            .filter(|(_, c)| self.conversation_matches_filter(c))
             .map(|(i, _)| i)
             .collect();
+        self.filter_progress = None;
+        self.update_effective_cache(); // Rebuild cache after full update
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
@@ -619,11 +573,23 @@ impl App {
             .and_then(|&i| self.conversations.get(i))
     }
 
+    /// Invalidate the cached effective indices (call when filter/search/sort changes)
+    fn invalidate_effective_cache(&mut self) {
+        self.cached_effective_indices = None;
+    }
+
+    /// Get effective indices, using cache when possible
     fn effective_indices(&self) -> Vec<usize> {
-        let mut indices = if self.search.query.is_empty() {
-            self.filtered_indices.clone()
+        // Return cached version if available
+        if let Some(ref cached) = self.cached_effective_indices {
+            return cached.clone();
+        }
+
+        // Compute indices
+        let mut indices: Vec<usize> = if self.search.query.is_empty() {
+            self.filtered_indices.iter().copied().collect()
         } else {
-            // Intersection of filtered and search matches
+            // Intersection of filtered and search matches (O(1) lookup per item)
             self.search
                 .matches
                 .iter()
@@ -658,6 +624,12 @@ impl App {
         }
 
         indices
+    }
+
+    /// Update the effective indices cache (call after search/filter/sort changes stabilize)
+    pub fn update_effective_cache(&mut self) {
+        let indices = self.effective_indices();
+        self.cached_effective_indices = Some(indices);
     }
 
     pub fn visible_conversations(&self) -> Vec<(usize, &Conversation)> {
@@ -735,6 +707,10 @@ impl App {
     pub fn enter_search_mode(&mut self) {
         self.mode = Mode::Search;
         self.search.query.clear();
+        self.search.query_lower.clear();
+        self.search.matches.clear();
+        self.search.search_progress = None;
+        self.invalidate_effective_cache();
     }
 
     pub fn exit_search_mode(&mut self) {
@@ -743,28 +719,131 @@ impl App {
 
     pub fn clear_search(&mut self) {
         self.search.query.clear();
+        self.search.query_lower.clear();
         self.search.matches.clear();
         self.search.current_match = 0;
+        self.search.search_progress = None;
         self.selected_index = 0;
+        self.invalidate_effective_cache();
         self.mode = Mode::Normal;
     }
 
-    pub fn update_search(&mut self) {
+    /// Start an incremental search (called when query changes)
+    fn start_search(&mut self) {
+        self.search.matches.clear();
+        self.search.query_lower = self.search.query.to_lowercase();
         if self.search.query.is_empty() {
-            self.search.matches.clear();
-            return;
+            self.search.search_progress = None;
+        } else {
+            self.search.search_progress = Some(0);
         }
-
-        self.search.matches = self
-            .conversations
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.contains(&self.search.query))
-            .map(|(i, _)| i)
-            .collect();
-
         self.selected_index = 0;
         self.search.current_match = 0;
+        self.invalidate_effective_cache();
+    }
+
+    /// Continue incremental search processing. Returns true if more work remains.
+    pub fn continue_search(&mut self, batch_size: usize) -> bool {
+        let Some(start) = self.search.search_progress else {
+            return false;
+        };
+
+        if self.search.query_lower.is_empty() {
+            self.search.search_progress = None;
+            return false;
+        }
+
+        // If trigram index is available and query is long enough, use it for instant results
+        if start == 0 {
+            if let Some(ref index) = self.trigram_index {
+                if let Some(candidates) = index.search_candidates(&self.search.query_lower) {
+                    // Verify candidates with actual substring match
+                    self.search.matches = candidates
+                        .into_iter()
+                        .filter(|&i| self.conversations[i].contains(&self.search.query_lower))
+                        .collect();
+                    self.search.search_progress = None;
+                    self.update_effective_cache(); // Rebuild cache on completion
+                    return false;
+                }
+            }
+        }
+
+        // Fall back to linear scan
+        let end = (start + batch_size).min(self.conversations.len());
+
+        for i in start..end {
+            if self.conversations[i].contains(&self.search.query_lower) {
+                self.search.matches.push(i);
+            }
+        }
+
+        if end >= self.conversations.len() {
+            self.search.search_progress = None;
+            self.update_effective_cache(); // Rebuild cache on completion
+            false
+        } else {
+            self.search.search_progress = Some(end);
+            // Don't invalidate cache every batch - results are appending
+            true
+        }
+    }
+
+    /// Check if search is in progress
+    pub fn is_search_in_progress(&self) -> bool {
+        self.search.search_progress.is_some()
+    }
+
+    /// Get search progress as (current, total)
+    pub fn search_progress(&self) -> Option<(usize, usize)> {
+        self.search.search_progress.map(|p| (p, self.conversations.len()))
+    }
+
+    // Index methods
+
+    /// Start building the trigram search index
+    pub fn start_index_build(&mut self) {
+        if self.trigram_index.is_some() || self.index_builder.is_some() {
+            return; // Already built or building
+        }
+        self.index_builder = Some(TrigramIndexBuilder::new(self.conversations.len()));
+    }
+
+    /// Continue building the index. Returns true if more work remains.
+    pub fn continue_index_build(&mut self, batch_size: usize) -> bool {
+        let Some(ref mut builder) = self.index_builder else {
+            return false;
+        };
+
+        let has_more = builder.process_batch(&self.conversations, batch_size);
+
+        if !has_more {
+            // Finished building - move index to final storage
+            let builder = self.index_builder.take().unwrap();
+            self.trigram_index = Some(builder.finish());
+        }
+
+        has_more
+    }
+
+    /// Check if index is being built
+    pub fn is_index_building(&self) -> bool {
+        self.index_builder.is_some()
+    }
+
+    /// Get index build progress as (current, total)
+    pub fn index_build_progress(&self) -> Option<(usize, usize)> {
+        self.index_builder.as_ref().map(|b| b.progress())
+    }
+
+    /// Check if trigram index is available
+    pub fn has_search_index(&self) -> bool {
+        self.trigram_index.is_some()
+    }
+
+    /// Get index memory usage in bytes
+    pub fn index_memory_usage(&self) -> Option<usize> {
+        self.trigram_index.as_ref().map(|i| i.memory_usage())
     }
 
     pub fn next_match(&mut self) {
@@ -791,12 +870,12 @@ impl App {
 
     pub fn push_search_char(&mut self, c: char) {
         self.search.query.push(c);
-        self.update_search();
+        self.start_search();
     }
 
     pub fn pop_search_char(&mut self) {
         self.search.query.pop();
-        self.update_search();
+        self.start_search();
     }
 
     // Filter methods
@@ -810,11 +889,162 @@ impl App {
 
     pub fn clear_filter(&mut self) {
         self.filter.expression.clear();
-        self.filter.filters.clear();
+        self.filter.parsed = None;
         self.filter.error = None;
-        self.update_filtered_indices();
+        // Reset to all indices
+        self.filtered_indices = (0..self.conversations.len()).collect();
+        self.filter_progress = None;
         self.selected_index = 0;
+        self.invalidate_effective_cache();
         self.mode = Mode::Normal;
+    }
+
+    /// Start incremental filter (called when filter expression changes)
+    fn start_filter(&mut self) {
+        self.filter.update();
+        if !self.filter.is_active() {
+            // No filter active - include all
+            self.filtered_indices = (0..self.conversations.len()).collect();
+            self.filter_progress = None;
+        } else if let Some(ref expr) = self.filter.parsed.clone() {
+            // Try index-based evaluation first (O(log n) for numeric comparisons)
+            if let Some(matches) = self.evaluate_filter_with_index(&expr) {
+                self.filtered_indices = matches;
+                self.filter_progress = None;
+                self.invalidate_effective_cache();
+            } else {
+                // Fall back to incremental filter for complex expressions
+                self.reset_filter();
+            }
+        } else {
+            // Parse error or empty - include all
+            self.filtered_indices = (0..self.conversations.len()).collect();
+            self.filter_progress = None;
+        }
+        self.selected_index = 0;
+    }
+
+    /// Check if filter is in progress
+    pub fn is_filter_in_progress(&self) -> bool {
+        self.filter_progress.is_some()
+    }
+
+    /// Get filter progress as (current, total)
+    pub fn filter_progress(&self) -> Option<(usize, usize)> {
+        self.filter_progress.map(|p| (p, self.conversations.len()))
+    }
+
+    /// Ensure a field index exists, building it if necessary
+    fn ensure_field_index(&mut self, field: &str) {
+        if !self.field_indices.contains_key(field) {
+            let index = SortedFieldIndex::build(&self.conversations, field);
+            self.field_indices.insert(field.to_string(), index);
+        }
+    }
+
+    /// Collect all numeric fields referenced in a filter expression
+    fn collect_numeric_fields(expr: &FilterExpr, fields: &mut Vec<String>) {
+        match expr {
+            FilterExpr::Comparison { field, value: Value::Number(_), .. } => {
+                if !fields.contains(field) {
+                    fields.push(field.clone());
+                }
+            }
+            FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+                Self::collect_numeric_fields(left, fields);
+                Self::collect_numeric_fields(right, fields);
+            }
+            FilterExpr::Not(inner) => {
+                Self::collect_numeric_fields(inner, fields);
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to evaluate a filter expression using indices for O(log n) performance.
+    /// Returns Some(matching_indices) if index-based evaluation was possible,
+    /// None if we need to fall back to linear scan.
+    fn evaluate_filter_with_index(&mut self, expr: &FilterExpr) -> Option<HashSet<usize>> {
+        // First, build all needed indices
+        let mut fields = Vec::new();
+        Self::collect_numeric_fields(expr, &mut fields);
+        for field in &fields {
+            self.ensure_field_index(field);
+        }
+
+        // Now evaluate using immutable borrows
+        let conv_count = self.conversations.len();
+        self.evaluate_filter_expr_with_index(expr, conv_count)
+    }
+
+    /// Internal evaluation using pre-built indices (no mutable borrows)
+    fn evaluate_filter_expr_with_index(&self, expr: &FilterExpr, conv_count: usize) -> Option<HashSet<usize>> {
+        match expr {
+            FilterExpr::True => {
+                // All conversations match
+                Some((0..conv_count).collect())
+            }
+            FilterExpr::Comparison { field, op, value } => {
+                // Only numeric comparisons can use the index
+                let Value::Number(threshold) = value else {
+                    return None;
+                };
+
+                let index = self.field_indices.get(field)?;
+                let matches: HashSet<usize> = match op {
+                    CompareOp::Gt => index.greater_than(*threshold).iter().map(|(_, i)| *i).collect(),
+                    CompareOp::Gte => index.greater_or_equal(*threshold).iter().map(|(_, i)| *i).collect(),
+                    CompareOp::Lt => index.less_than(*threshold).iter().map(|(_, i)| *i).collect(),
+                    CompareOp::Lte => index.less_or_equal(*threshold).iter().map(|(_, i)| *i).collect(),
+                    CompareOp::Eq => {
+                        // For equality, find exact matches in the sorted range
+                        let gte = index.greater_or_equal(*threshold);
+                        gte.iter()
+                            .take_while(|(v, _)| (*v - threshold).abs() < f64::EPSILON)
+                            .map(|(_, i)| *i)
+                            .collect()
+                    }
+                    CompareOp::Neq => {
+                        // All except those equal to threshold
+                        let all: HashSet<usize> = (0..conv_count).collect();
+                        let eq: HashSet<usize> = {
+                            let gte = index.greater_or_equal(*threshold);
+                            gte.iter()
+                                .take_while(|(v, _)| (*v - threshold).abs() < f64::EPSILON)
+                                .map(|(_, i)| *i)
+                                .collect()
+                        };
+                        all.difference(&eq).copied().collect()
+                    }
+                };
+                Some(matches)
+            }
+            FilterExpr::And(left, right) => {
+                // Try to evaluate both sides with indices
+                let left_matches = self.evaluate_filter_expr_with_index(left, conv_count)?;
+                let right_matches = self.evaluate_filter_expr_with_index(right, conv_count)?;
+                Some(left_matches.intersection(&right_matches).copied().collect())
+            }
+            FilterExpr::Or(left, right) => {
+                // Try to evaluate both sides with indices
+                let left_matches = self.evaluate_filter_expr_with_index(left, conv_count)?;
+                let right_matches = self.evaluate_filter_expr_with_index(right, conv_count)?;
+                Some(left_matches.union(&right_matches).copied().collect())
+            }
+            FilterExpr::Not(inner) => {
+                // Try to evaluate inner with index
+                let inner_matches = self.evaluate_filter_expr_with_index(inner, conv_count)?;
+                let all: HashSet<usize> = (0..conv_count).collect();
+                Some(all.difference(&inner_matches).copied().collect())
+            }
+            // Special filters (tags/notes) require per-conversation evaluation
+            FilterExpr::Special(_) => None,
+        }
+    }
+
+    /// Clear field indices (call when conversations change)
+    fn invalidate_field_indices(&mut self) {
+        self.field_indices.clear();
     }
 
     pub fn apply_filter(&mut self) {
@@ -828,32 +1058,20 @@ impl App {
     pub fn push_filter_char(&mut self, c: char) {
         self.filter.expression.push(c);
         self.filter.reset_completion();
-        // Live preview - update as user types
-        self.filter.update();
-        self.update_filtered_indices();
-        if self.selected_index >= self.total_visible() {
-            self.selected_index = 0;
-        }
+        // Live preview - start incremental filter
+        self.start_filter();
     }
 
     pub fn pop_filter_char(&mut self) {
         self.filter.expression.pop();
         self.filter.reset_completion();
-        self.filter.update();
-        self.update_filtered_indices();
-        if self.selected_index >= self.total_visible() {
-            self.selected_index = 0;
-        }
+        self.start_filter();
     }
 
     pub fn complete_filter(&mut self) {
         if self.filter.try_complete(&self.metadata_fields) {
             // Update filter after completion
-            self.filter.update();
-            self.update_filtered_indices();
-            if self.selected_index >= self.total_visible() {
-                self.selected_index = 0;
-            }
+            self.start_filter();
         }
     }
 
@@ -1234,29 +1452,45 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter_expr::{FilterExpr, CompareOp, Value};
 
     #[test]
     fn test_filter_parse_boolean() {
-        let filter = Filter::parse("is_refusal=true").unwrap();
-        assert_eq!(filter.field, "is_refusal");
-        assert_eq!(filter.op, FilterOp::Eq);
-        assert_eq!(filter.value, FilterValue::Bool(true));
+        let filter = FilterExpr::parse("is_refusal=true").unwrap();
+        if let FilterExpr::Comparison { field, op, value } = filter {
+            assert_eq!(field, "is_refusal");
+            assert_eq!(op, CompareOp::Eq);
+            assert_eq!(value, Value::Bool(true));
+        } else {
+            panic!("Expected Comparison");
+        }
 
-        let filter = Filter::parse("is_truncated=false").unwrap();
-        assert_eq!(filter.field, "is_truncated");
-        assert_eq!(filter.value, FilterValue::Bool(false));
+        let filter = FilterExpr::parse("is_truncated=false").unwrap();
+        if let FilterExpr::Comparison { value, .. } = filter {
+            assert_eq!(value, Value::Bool(false));
+        } else {
+            panic!("Expected Comparison");
+        }
 
-        let filter = Filter::parse("field!=TRUE").unwrap();
-        assert_eq!(filter.op, FilterOp::Neq);
-        assert_eq!(filter.value, FilterValue::Bool(true));
+        let filter = FilterExpr::parse("field!=true").unwrap();
+        if let FilterExpr::Comparison { op, value, .. } = filter {
+            assert_eq!(op, CompareOp::Neq);
+            assert_eq!(value, Value::Bool(true));
+        } else {
+            panic!("Expected Comparison");
+        }
     }
 
     #[test]
     fn test_filter_parse_number() {
-        let filter = Filter::parse("score>90").unwrap();
-        assert_eq!(filter.field, "score");
-        assert_eq!(filter.op, FilterOp::Gt);
-        assert_eq!(filter.value, FilterValue::Number(90.0));
+        let filter = FilterExpr::parse("score>90").unwrap();
+        if let FilterExpr::Comparison { field, op, value } = filter {
+            assert_eq!(field, "score");
+            assert_eq!(op, CompareOp::Gt);
+            assert_eq!(value, Value::Number(90.0));
+        } else {
+            panic!("Expected Comparison");
+        }
     }
 
     #[test]
@@ -1276,15 +1510,16 @@ mod tests {
             file_hash: "abc123".to_string(),
             metadata,
             preview_text: None,
+            search_text: "test".to_string(),
         };
 
-        let filter_true = Filter::parse("is_refusal=true").unwrap();
-        let filter_false = Filter::parse("is_refusal=false").unwrap();
-        let filter_neq = Filter::parse("is_refusal!=true").unwrap();
+        let filter_true = FilterExpr::parse("is_refusal=true").unwrap();
+        let filter_false = FilterExpr::parse("is_refusal=false").unwrap();
+        let filter_neq = FilterExpr::parse("is_refusal!=true").unwrap();
 
-        assert!(filter_true.matches(&conv));
-        assert!(!filter_false.matches(&conv));
-        assert!(!filter_neq.matches(&conv));
+        assert!(filter_true.matches(&conv, None));
+        assert!(!filter_false.matches(&conv, None));
+        assert!(!filter_neq.matches(&conv, None));
     }
 
     #[test]

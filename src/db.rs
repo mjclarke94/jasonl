@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,16 +21,6 @@ fn get_default_db_path() -> PathBuf {
     };
 
     db_dir.join("data.db")
-}
-
-/// Compute SHA256 hash of a file
-pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    let contents = fs::read(path.as_ref())
-        .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&contents);
-    let result = hasher.finalize();
-    Ok(format!("{:x}", result))
 }
 
 #[derive(Debug, Clone)]
