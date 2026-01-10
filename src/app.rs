@@ -431,9 +431,9 @@ impl App {
         // Sort metadata fields
         self.metadata_fields.sort();
 
-        // Invalidate caches since indices changed
-        self.invalidate_effective_cache();
+        // Update caches since indices changed
         self.invalidate_field_indices();
+        self.update_effective_cache();
     }
 
     pub fn new(conversations: Vec<Conversation>, file_path: String, file_hashes: HashMap<String, String>, db: Database) -> Self {
@@ -774,7 +774,7 @@ impl App {
         self.search.query_lower.clear();
         self.search.matches.clear();
         self.search.search_progress = None;
-        self.invalidate_effective_cache();
+        self.update_effective_cache();
     }
 
     pub fn exit_search_mode(&mut self) {
@@ -788,7 +788,7 @@ impl App {
         self.search.current_match = 0;
         self.search.search_progress = None;
         self.selected_index = 0;
-        self.invalidate_effective_cache();
+        self.update_effective_cache();
         self.mode = Mode::Normal;
     }
 
@@ -959,7 +959,7 @@ impl App {
         self.filtered_indices = (0..self.conversations.len()).collect();
         self.filter_progress = None;
         self.selected_index = 0;
-        self.invalidate_effective_cache();
+        self.update_effective_cache();
         self.mode = Mode::Normal;
     }
 
@@ -970,12 +970,13 @@ impl App {
             // No filter active - include all
             self.filtered_indices = (0..self.conversations.len()).collect();
             self.filter_progress = None;
+            self.update_effective_cache();
         } else if let Some(ref expr) = self.filter.parsed.clone() {
             // Try index-based evaluation first (O(log n) for numeric comparisons)
             if let Some(matches) = self.evaluate_filter_with_index(&expr) {
                 self.filtered_indices = matches;
                 self.filter_progress = None;
-                self.invalidate_effective_cache();
+                self.update_effective_cache();
             } else {
                 // Fall back to incremental filter for complex expressions
                 self.reset_filter();
@@ -984,6 +985,7 @@ impl App {
             // Parse error or empty - include all
             self.filtered_indices = (0..self.conversations.len()).collect();
             self.filter_progress = None;
+            self.update_effective_cache();
         }
         self.selected_index = 0;
     }
@@ -1454,6 +1456,7 @@ impl App {
                 self.sort.order = SortOrder::Ascending;
             }
             self.selected_index = 0;
+            self.update_effective_cache();
         }
     }
 
@@ -1461,6 +1464,7 @@ impl App {
         self.sort.field = None;
         self.sort.order = SortOrder::None;
         self.selected_index = 0;
+        self.update_effective_cache();
     }
 
     // Collapse mode
