@@ -45,6 +45,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('>') | KeyCode::Char('.') => app.increase_list_width(),
         KeyCode::Char('<') | KeyCode::Char(',') => app.decrease_list_width(),
         KeyCode::Char('c') => app.cycle_collapse_mode(),
+        KeyCode::Char('I') => app.start_index_build(),
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Esc => {
             if app.filter.is_active() {

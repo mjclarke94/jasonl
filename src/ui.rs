@@ -8,8 +8,9 @@ use ratatui::{
 
 use crate::app::{App, CollapseMode, Mode};
 use crate::data::Role;
+use crate::streaming_loader::StreamingLoader;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &App, loader: Option<&StreamingLoader>) {
     // Determine if we need stats bar
     let show_stats = app.is_filtered_view() && !app.global_stats.fields.is_empty();
 
@@ -62,7 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_message_view(frame, app, main_chunks[1]);
     }
 
-    draw_status_bar(frame, app, status_area);
+    draw_status_bar(frame, app, loader, status_area);
 
     // Draw popups on top
     match app.mode {
@@ -279,12 +280,44 @@ fn draw_message_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, content_area);
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status_bar(frame: &mut Frame, app: &App, loader: Option<&StreamingLoader>, area: Rect) {
     let status = match app.mode {
         Mode::Normal => {
             let mut spans = vec![
                 Span::styled(format!(" {} ", app.file_path), Style::default().fg(Color::Cyan)),
             ];
+
+            // Show loading progress if still loading
+            if let Some(l) = loader {
+                let (files_done, files_total, _lines) = l.progress();
+                let convs = l.stats.conversations_loaded;
+                let errors = l.stats.errors.len();
+                spans.push(Span::raw(" | "));
+                let mut loading_text = format!("loading {}/{} files ({} convs", files_done, files_total, convs);
+                if errors > 0 {
+                    loading_text.push_str(&format!(", {} errors", errors));
+                }
+                loading_text.push_str(") ");
+                spans.push(Span::styled(
+                    loading_text,
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if let Some((current, total)) = app.index_build_progress() {
+                // Show index building progress
+                spans.push(Span::raw(" | "));
+                let pct = (current as f64 / total as f64 * 100.0) as u8;
+                spans.push(Span::styled(
+                    format!("indexing {}% ", pct),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if app.has_search_index() {
+                spans.push(Span::raw(" | "));
+                let mem_mb = app.index_memory_usage().unwrap_or(0) as f64 / 1_000_000.0;
+                spans.push(Span::styled(
+                    format!("indexed ({:.0}MB) ", mem_mb),
+                    Style::default().fg(Color::Green),
+                ));
+            }
 
             // Show active filter if present
             if app.filter.is_active() {
@@ -322,10 +355,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Search => {
             let search_prompt = format!(" /{}█ ", app.search.query);
-            let match_info = if app.search.matches.is_empty() && !app.search.query.is_empty() {
-                " (no matches)".to_string()
+            let indexed = if app.has_search_index() && app.search.query.len() >= 3 { " [indexed]" } else { "" };
+            let match_info = if let Some((current, total)) = app.search_progress() {
+                // Search in progress
+                format!(" (searching... {}/{} - {} found)", current, total, app.search.matches.len())
+            } else if app.search.matches.is_empty() && !app.search.query.is_empty() {
+                format!(" (no matches){}", indexed)
             } else if !app.search.matches.is_empty() {
-                format!(" ({} matches)", app.search.matches.len())
+                format!(" ({} matches){}", app.search.matches.len(), indexed)
             } else {
                 String::new()
             };
@@ -336,11 +373,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Filter => {
             let filter_prompt = format!(" filter: {}█ ", app.filter.expression);
-            let match_count = app.total_visible();
             let total = app.conversations.len();
             let info = if let Some(ref err) = app.filter.error {
                 Span::styled(format!(" {} ", err), Style::default().fg(Color::Red))
+            } else if let Some((current, filter_total)) = app.filter_progress() {
+                // Filter in progress
+                let match_count = app.total_visible();
+                Span::styled(
+                    format!(" (filtering... {}/{} - {} matching) ", current, filter_total, match_count),
+                    Style::default().fg(Color::DarkGray),
+                )
             } else {
+                let match_count = app.total_visible();
                 Span::styled(
                     format!(" ({}/{} matching) ", match_count, total),
                     Style::default().fg(Color::DarkGray),
@@ -505,7 +549,8 @@ fn draw_help_popup(frame: &mut Frame) {
         Line::from("  F           Clear filter"),
         Line::from("  Tab         Autocomplete field name"),
         Line::from("              Operators: > < >= <= = !="),
-        Line::from("              Multiple: score>90,other<50"),
+        Line::from("              Logic: AND OR NOT ( )"),
+        Line::from("              Ex: (x>90 AND y=true) OR z<50"),
         Line::from("              Tags: tag:name, has:tags, no:tags"),
         Line::from("              Notes: has:notes, no:notes"),
         Line::from(""),
@@ -527,6 +572,7 @@ fn draw_help_popup(frame: &mut Frame) {
         Line::from("  T           Tag manager (create/delete tags)"),
         Line::from(""),
         Line::from(Span::styled("General", Style::default().fg(Color::Yellow))),
+        Line::from("  I           Build search index (for large files)"),
         Line::from("  c           Cycle collapse mode"),
         Line::from("  > or .      Increase list panel width"),
         Line::from("  < or ,      Decrease list panel width"),
