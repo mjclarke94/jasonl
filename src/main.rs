@@ -131,6 +131,9 @@ fn run_app(
     app: &mut App,
     mut loader: Option<streaming_loader::StreamingLoader>,
 ) -> Result<()> {
+    // Store loading errors to display after app exits
+    let mut loading_errors: Vec<streaming_loader::LoadError> = Vec::new();
+
     loop {
         // Process file loading
         let loading_pending = if let Some(ref mut l) = loader {
@@ -139,12 +142,8 @@ fn run_app(
                 app.add_conversations(new_convs, &l.file_hashes);
             }
             if !has_more {
-                // Loading complete - print any errors
-                let stats = &l.stats;
-                if !stats.errors.is_empty() {
-                    // Store error count for potential display
-                    // (errors will be shown after app exits)
-                }
+                // Loading complete - capture errors before dropping loader
+                loading_errors = std::mem::take(&mut l.stats.errors);
                 loader = None;
             }
             has_more
@@ -182,13 +181,11 @@ fn run_app(
     }
 
     // Print loading errors on exit
-    if let Some(l) = loader {
-        for err in &l.stats.errors {
-            if let Some(line) = err.line {
-                eprintln!("Warning: {}:{}: {}", err.file, line, err.message);
-            } else {
-                eprintln!("Warning: {}: {}", err.file, err.message);
-            }
+    for err in &loading_errors {
+        if let Some(line) = err.line {
+            eprintln!("Warning: {}:{}: {}", err.file, line, err.message);
+        } else {
+            eprintln!("Warning: {}: {}", err.file, err.message);
         }
     }
 

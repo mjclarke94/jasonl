@@ -544,11 +544,11 @@ impl App {
 
         if end >= self.conversations.len() {
             self.filter_progress = None;
-            self.invalidate_effective_cache();
+            self.update_effective_cache(); // Rebuild cache on completion
             false
         } else {
             self.filter_progress = Some(end);
-            self.invalidate_effective_cache();
+            self.invalidate_effective_cache(); // Invalidate during incremental work
             true
         }
     }
@@ -563,7 +563,7 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         self.filter_progress = None;
-        self.invalidate_effective_cache();
+        self.update_effective_cache(); // Rebuild cache after full update
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
@@ -763,7 +763,7 @@ impl App {
                         .filter(|&i| self.conversations[i].contains(&self.search.query_lower))
                         .collect();
                     self.search.search_progress = None;
-                    self.invalidate_effective_cache();
+                    self.update_effective_cache(); // Rebuild cache on completion
                     return false;
                 }
             }
@@ -780,7 +780,7 @@ impl App {
 
         if end >= self.conversations.len() {
             self.search.search_progress = None;
-            self.invalidate_effective_cache();
+            self.update_effective_cache(); // Rebuild cache on completion
             false
         } else {
             self.search.search_progress = Some(end);

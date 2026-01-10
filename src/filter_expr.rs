@@ -234,13 +234,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Not);
                 }
             }
-            '0'..='9' | '-' | '.' => {
+            '0'..='9' => {
                 let mut num_str = String::new();
-                // Handle negative sign
-                if c == '-' {
-                    num_str.push(c);
-                    chars.next();
-                }
                 while let Some(&c) = chars.peek() {
                     if c.is_ascii_digit() || c == '.' {
                         num_str.push(c);
@@ -253,6 +248,62 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Number(num));
                 } else {
                     return Err(format!("Invalid number: {}", num_str));
+                }
+            }
+            '-' => {
+                // Check if this is a negative number (followed by digit or dot+digit)
+                let mut lookahead = chars.clone();
+                lookahead.next(); // skip the '-'
+                let is_number = match lookahead.peek() {
+                    Some('0'..='9') => true,
+                    Some('.') => {
+                        lookahead.next();
+                        matches!(lookahead.peek(), Some('0'..='9'))
+                    }
+                    _ => false,
+                };
+                if is_number {
+                    let mut num_str = String::from("-");
+                    chars.next(); // consume the '-'
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() || c == '.' {
+                            num_str.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(num) = num_str.parse::<f64>() {
+                        tokens.push(Token::Number(num));
+                    } else {
+                        return Err(format!("Invalid number: {}", num_str));
+                    }
+                } else {
+                    return Err(format!("Unexpected character: {}", c));
+                }
+            }
+            '.' => {
+                // Check if this is a decimal number starting with dot (e.g., .5)
+                let mut lookahead = chars.clone();
+                lookahead.next(); // skip the '.'
+                if matches!(lookahead.peek(), Some('0'..='9')) {
+                    let mut num_str = String::from(".");
+                    chars.next(); // consume the '.'
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() {
+                            num_str.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(num) = num_str.parse::<f64>() {
+                        tokens.push(Token::Number(num));
+                    } else {
+                        return Err(format!("Invalid number: {}", num_str));
+                    }
+                } else {
+                    return Err(format!("Unexpected character: {}", c));
                 }
             }
             '"' | '\'' => {
@@ -532,5 +583,33 @@ mod tests {
     fn test_empty_filter() {
         let expr = FilterExpr::parse("").unwrap();
         assert!(matches!(expr, FilterExpr::True));
+    }
+
+    #[test]
+    fn test_negative_numbers() {
+        let expr = FilterExpr::parse("score > -10").unwrap();
+        if let FilterExpr::Comparison { value: Value::Number(n), .. } = expr {
+            assert_eq!(n, -10.0);
+        } else {
+            panic!("Expected numeric comparison");
+        }
+
+        // Decimal starting with dot
+        let expr = FilterExpr::parse("score > .5").unwrap();
+        if let FilterExpr::Comparison { value: Value::Number(n), .. } = expr {
+            assert_eq!(n, 0.5);
+        } else {
+            panic!("Expected numeric comparison");
+        }
+    }
+
+    #[test]
+    fn test_standalone_dash_dot_rejected() {
+        // Standalone dash should error, not be parsed as a number
+        assert!(FilterExpr::parse("score > -").is_err());
+        // Standalone dot should error
+        assert!(FilterExpr::parse("score > .").is_err());
+        // Dash not followed by digit should error
+        assert!(FilterExpr::parse("score > -abc").is_err());
     }
 }
